@@ -1,0 +1,13 @@
+target/
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

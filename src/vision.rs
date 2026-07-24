@@ -22,6 +22,10 @@ const LEFT_EYE_OUTER: usize = 33;
 const LEFT_EYE_INNER: usize = 133;
 const RIGHT_EYE_INNER: usize = 362;
 const RIGHT_EYE_OUTER: usize = 263;
+const LEFT_UPPER_LID: usize = 159;
+const LEFT_LOWER_LID: usize = 145;
+const RIGHT_UPPER_LID: usize = 386;
+const RIGHT_LOWER_LID: usize = 374;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Landmark {
@@ -44,6 +48,7 @@ pub struct EyeFeatures {
     pub y: f64,
     pub confidence: f32,
     pub one_eye_fallback: bool,
+    pub blink: bool,
 }
 
 /// Translate iris position into a head-pose-tolerant normalized feature. Screen calibration maps
@@ -59,21 +64,49 @@ pub fn extract_eye_features(frame: &LandmarkFrame) -> Option<EyeFeatures> {
         RIGHT_EYE_OUTER,
         RIGHT_EYE_INNER,
     );
+    let blink = both_eyes_closed(&frame.landmarks);
     match (left, right) {
         (Some(left), Some(right)) => Some(EyeFeatures {
             x: (left.0 + right.0) / 2.0,
             y: (left.1 + right.1) / 2.0,
             confidence: frame.face_confidence.min(left.2).min(right.2),
             one_eye_fallback: false,
+            blink,
         }),
         (Some(eye), None) | (None, Some(eye)) => Some(EyeFeatures {
             x: eye.0,
             y: eye.1,
             confidence: frame.face_confidence.min(eye.2) * 0.85,
             one_eye_fallback: true,
+            blink,
         }),
         (None, None) => None,
     }
+}
+
+fn both_eyes_closed(landmarks: &[Landmark]) -> bool {
+    fn opening(
+        landmarks: &[Landmark],
+        upper: usize,
+        lower: usize,
+        outer: usize,
+        inner: usize,
+    ) -> Option<f32> {
+        let upper = landmarks.get(upper)?;
+        let lower = landmarks.get(lower)?;
+        let outer = landmarks.get(outer)?;
+        let inner = landmarks.get(inner)?;
+        let vertical = (upper.x - lower.x).hypot(upper.y - lower.y);
+        let width = (outer.x - inner.x).hypot(outer.y - inner.y);
+        (width > 1e-4).then_some(vertical / width)
+    }
+    matches!(
+        (
+            opening(landmarks, LEFT_UPPER_LID, LEFT_LOWER_LID, LEFT_EYE_OUTER, LEFT_EYE_INNER),
+            opening(landmarks, RIGHT_UPPER_LID, RIGHT_LOWER_LID, RIGHT_EYE_OUTER, RIGHT_EYE_INNER),
+        ),
+        (Some(left), Some(right)) if left < 0.075 && right < 0.075
+    )
 }
 
 fn normalized_iris(

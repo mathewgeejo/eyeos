@@ -257,9 +257,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::at(directory.path().to_path_buf());
         let profile = CalibrationProfile {
-            x_coefficients: [1.0, 2.0, 3.0],
-            y_coefficients: [4.0, 5.0, 6.0],
-            sample_count: 9,
+            x_coefficients: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            y_coefficients: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            sample_count: 25,
             median_error_px: 1.5,
         };
         store.save_calibration(&profile).unwrap();

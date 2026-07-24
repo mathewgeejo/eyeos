@@ -9,7 +9,7 @@ predictions remain on the device.
 ## Launch behaviour
 
 Running `eyeos.exe` opens only a small transparent control blob in the bottom-left corner.
-There is no startup dashboard or menu. With a valid local tracker and saved calibration, it
+There is no startup dashboard or menu. With a valid local tracker and independently validated calibration, it
 starts tracking immediately. An 800 ms dwell on the blob opens the compact 3×3 action pad;
 choosing an action returns to the blob. The gaze keyboard is also a compact bottom overlay and
 supports direct dwell selection, without requiring a mouse click.
@@ -18,10 +18,14 @@ Caregiver-only surfaces remain available through `--setup` and `--training`. The
 uses dry-run input. Live desktop input is enabled only after a reviewed local model and saved
 calibration are present; if either is absent, EyeOS stays paused instead of guessing.
 
-EyeOS now embeds a pinned official MediaPipe Face Landmarker task bundle and the matching Windows
-MediaPipe C runtime. The webcam worker uses the 478 local face/iris landmarks to feed the gaze
-calibration and dwell-control engine. Model and runtime hashes are checked before use, and their
-source/provenance is recorded in [`assets/models/NOTICE.md`](assets/models/NOTICE.md).
+EyeOS embeds a pinned MediaPipe Face Landmarker task bundle, the matching Windows MediaPipe C
+runtime, the OpenVINO CPU runtime, and local Open Model Zoo head-pose and gaze-vector networks.
+MediaPipe is used only to locate and rotate face/eye crops from the current RGB frame. OpenVINO
+runs head-pose inference followed by binocular gaze-vector inference on the CPU; a per-user
+quadratic calibration maps that vector to the primary screen. Runtime and model hashes are
+checked before use, then the native DLLs/models are extracted only to EyeOS's per-user managed
+runtime folder. Provenance is recorded in [`assets/models/NOTICE.md`](assets/models/NOTICE.md)
+and [`assets/models/openvino/NOTICE.md`](assets/models/openvino/NOTICE.md).
 
 ## Build
 
@@ -44,10 +48,11 @@ eyeos.exe --install-autostart
 eyeos.exe --reset-profile
 ```
 
-First-time caregiver setup: run `eyeos.exe --setup`, start the 9-point calibration, let the
-intended user look at each target until it advances, then enable live input in Accessibility and
-safety settings. The tracker uses CPU inference on-device; it sends no webcam frames to EyeOS
-servers or a cloud service.
+First-time caregiver setup: run `eyeos.exe --setup`, start the 25-point gaze-vector calibration,
+and let the intended user fixate each target. EyeOS then runs a separate five-target validation
+pass and reports median error in pixels and centimetres. Live input remains unavailable unless
+that independent validation passes. The tracker uses CPU inference on-device; it sends no webcam
+frames to EyeOS servers or a cloud service.
 
 For developer verification only, `eyeos.exe --simulate-gaze` maps the physical mouse position
 through the gaze state machine in dry-run mode. It never sends input to another application.

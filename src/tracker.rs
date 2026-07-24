@@ -1,8 +1,8 @@
 //! Windows-only local webcam tracker backed by the MediaPipe Face Landmarker C API.
 //!
-//! The worker owns the webcam and the native library. It emits only normalized iris/eye
-//! features; frames, full face landmarks, and model output never leave this process or get
-//! persisted.
+//! The worker owns the webcam and native runtimes. It retains each RGB frame only long enough to
+//! crop the face and eyes, then emits the local OpenVINO gaze-vector feature. Frames, landmarks,
+//! and model output never leave this process or get persisted.
 
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -18,9 +18,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use libloading::Library;
 use sha2::{Digest, Sha256};
 
-use crate::vision::{
-    EyeFeatures, LANDMARK_COUNT, Landmark, LandmarkFrame, embedded_face_landmarker_model,
-    extract_eye_features,
+use crate::{
+    gaze_estimator::GazeEstimator,
+    vision::{
+        EyeFeatures, LANDMARK_COUNT, Landmark, LandmarkFrame, embedded_face_landmarker_model,
+    },
 };
 
 const MEDIAPIPE_RUNTIME_SHA256: &str =
@@ -48,6 +50,9 @@ pub enum TrackerStatus {
     },
     LowFrameRate {
         fps: f32,
+    },
+    GazeUnavailable {
+        detail: String,
     },
     NoFace,
     Failed(String),
@@ -78,7 +83,9 @@ impl LocalTracker {
             let (stop, stop_rx) = mpsc::channel();
             thread::Builder::new()
                 .name("eyeos-face-tracker".to_owned())
-                .spawn(move || run_worker(runtime_path, camera_index, event_tx, stop_rx))
+                .spawn(move || {
+                    run_worker(runtime_path, profile_root, camera_index, event_tx, stop_rx)
+                })
                 .context("starting the local eye-tracking worker")?;
             Ok(Self { events, stop })
         }
@@ -140,12 +147,23 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(feature = "camera")]
 fn run_worker(
     runtime_path: PathBuf,
+    profile_root: PathBuf,
     camera_index: u32,
     event_tx: Sender<TrackerEvent>,
     stop_rx: Receiver<()>,
 ) {
     let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::Starting));
-    let result = run_worker_inner(&runtime_path, camera_index, &event_tx, &stop_rx);
+    let result = (|| {
+        let mut gaze_estimator = GazeEstimator::load(&profile_root)
+            .context("loading the bundled OpenVINO gaze-estimation pipeline")?;
+        run_worker_inner(
+            &runtime_path,
+            &mut gaze_estimator,
+            camera_index,
+            &event_tx,
+            &stop_rx,
+        )
+    })();
     match result {
         Ok(()) => {
             let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::Stopped));
@@ -162,6 +180,7 @@ fn run_worker(
 #[cfg(feature = "camera")]
 fn run_worker_inner(
     runtime_path: &Path,
+    gaze_estimator: &mut GazeEstimator,
     camera_index: u32,
     event_tx: &Sender<TrackerEvent>,
     stop_rx: &Receiver<()>,
@@ -188,6 +207,7 @@ fn run_worker_inner(
 
         match run_capture_session(
             &landmarker,
+            gaze_estimator,
             CameraIndex::Index(camera_index),
             requested,
             event_tx,
@@ -215,6 +235,7 @@ fn run_worker_inner(
 #[cfg(feature = "camera")]
 fn run_capture_session(
     landmarker: &MediaPipeFaceLandmarker,
+    gaze_estimator: &mut GazeEstimator,
     camera_index: nokhwa::utils::CameraIndex,
     requested: nokhwa::utils::RequestedFormat<'static>,
     event_tx: &Sender<TrackerEvent>,
@@ -239,6 +260,7 @@ fn run_capture_session(
     let mut measured_at = started;
     let mut completed_frames = 0_u32;
     let mut last_no_face_at = started;
+    let mut last_gaze_error_at = started;
     let mut consecutive_frame_errors = 0_u8;
     loop {
         match stop_rx.try_recv() {
@@ -274,16 +296,31 @@ fn run_capture_session(
             timestamp_ms,
         )? {
             Some(landmarks) => {
-                if let Some(features) = extract_eye_features(&landmarks) {
-                    if event_tx
-                        .send(TrackerEvent::Features {
-                            features,
-                            timestamp_ms,
-                        })
-                        .is_err()
-                    {
-                        return Ok(());
+                match gaze_estimator.estimate(
+                    rgb.as_raw(),
+                    resolution.width_x,
+                    resolution.height_y,
+                    &landmarks,
+                ) {
+                    Ok(features) => {
+                        if event_tx
+                            .send(TrackerEvent::Features {
+                                features,
+                                timestamp_ms,
+                            })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
+                    Err(error) if last_gaze_error_at.elapsed().as_millis() >= 250 => {
+                        let _ =
+                            event_tx.send(TrackerEvent::Status(TrackerStatus::GazeUnavailable {
+                                detail: error.to_string(),
+                            }));
+                        last_gaze_error_at = Instant::now();
+                    }
+                    Err(_) => {}
                 }
             }
             None if last_no_face_at.elapsed().as_millis() >= 250 => {

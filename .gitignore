@@ -2,6 +2,7 @@ target/
 *.exe
 *.dll
 !assets/runtime/mediapipe/libmediapipe.dll
+!assets/runtime/openvino/*.dll
 *.pdb
 *.ilk
 *.exp

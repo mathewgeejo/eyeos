@@ -261,6 +261,9 @@ mod tests {
             y_coefficients: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
             sample_count: 25,
             median_error_px: 1.5,
+            validation_median_error_px: 2.0,
+            validation_median_error_cm: 0.05,
+            validation_passed: true,
         };
         store.save_calibration(&profile).unwrap();
         assert_eq!(store.load_calibration().unwrap(), Some(profile));

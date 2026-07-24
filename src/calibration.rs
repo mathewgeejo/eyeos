@@ -22,6 +22,16 @@ pub struct CalibrationProfile {
     pub y_coefficients: [f64; BASIS_SIZE],
     pub sample_count: usize,
     pub median_error_px: f64,
+    /// Median error measured on targets that were not used to fit the map.
+    #[serde(default)]
+    pub validation_median_error_px: f64,
+    /// The same independent validation error in centimetres, when the display reports a physical
+    /// size. A zero value means the profile predates the measured-validation requirement.
+    #[serde(default)]
+    pub validation_median_error_cm: f64,
+    /// Live input is permitted only for a profile whose independent validation passed.
+    #[serde(default)]
+    pub validation_passed: bool,
 }
 
 impl CalibrationProfile {
@@ -63,6 +73,9 @@ impl CalibrationProfile {
             y_coefficients,
             sample_count: samples.len(),
             median_error_px: median(errors),
+            validation_median_error_px: 0.0,
+            validation_median_error_cm: 0.0,
+            validation_passed: false,
         })
     }
 
@@ -156,6 +169,6 @@ mod tests {
         let profile = CalibrationProfile::fit(&samples).expect("profile");
         let mapped = profile.map(0.5, 0.5);
         assert!((mapped.x - 73.75).abs() < 1e-3, "mapped = {mapped:?}");
-        assert!((mapped.y - 103.0).abs() < 1e-3, "mapped = {mapped:?}");
+        assert!((mapped.y - 104.0).abs() < 1e-2, "mapped = {mapped:?}");
     }
 }

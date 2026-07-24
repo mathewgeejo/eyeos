@@ -4,6 +4,7 @@
 pub mod calibration;
 pub mod config;
 pub mod gaze;
+pub mod gaze_estimator;
 pub mod input;
 pub mod persistence;
 pub mod tracker;

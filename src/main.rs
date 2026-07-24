@@ -100,7 +100,11 @@ enum CalibrationPhase {
 }
 
 enum CalibrationOutcome {
-    Completed(CalibrationProfile),
+    Completed {
+        profile: CalibrationProfile,
+        validation_median_error_px: f64,
+        validation_median_error_cm: f64,
+    },
     Rejected(String),
 }
 
@@ -120,10 +124,11 @@ struct CalibrationWizard {
     phase: CalibrationPhase,
     maximum_fit_error_px: f64,
     maximum_validation_error_px: f64,
+    pixels_per_cm: f64,
 }
 
 impl CalibrationWizard {
-    fn new(screen_size: Point) -> Self {
+    fn new(screen_size: Point, pixels_per_cm: f64) -> Self {
         let mut targets = Vec::with_capacity(25);
         for y in [0.08, 0.29, 0.5, 0.71, 0.92] {
             for x in [0.08, 0.29, 0.5, 0.71, 0.92] {
@@ -144,7 +149,11 @@ impl CalibrationWizard {
             feature_samples: Vec::with_capacity(CALIBRATION_SAMPLES_PER_TARGET),
             phase: CalibrationPhase::Mapping,
             maximum_fit_error_px: diagonal * 0.10,
-            maximum_validation_error_px: (diagonal * 0.045).clamp(45.0, 90.0),
+            // A profile has to demonstrate a two-centimetre median error on independent targets.
+            // The fallback density is a conventional 96-DPI estimate when Windows does not report
+            // the panel's physical size.
+            maximum_validation_error_px: (pixels_per_cm * 2.0).clamp(45.0, 90.0),
+            pixels_per_cm,
         }
     }
 
@@ -180,22 +189,17 @@ impl CalibrationWizard {
         if self.target().is_none() {
             return None;
         }
-        let confirm_with_blink =
-            features.blink && self.feature_samples.len() >= CALIBRATION_SAMPLES_PER_TARGET;
-        if !confirm_with_blink {
-            if features.confidence < 0.72 || features.blink {
-                return None;
-            }
-            let settle_until = self
-                .settle_until_ms
-                .get_or_insert(timestamp_ms.saturating_add(900));
-            if timestamp_ms < *settle_until {
-                return None;
-            }
-            self.feature_samples.push(features);
-            if self.feature_samples.len() > CALIBRATION_SAMPLES_PER_TARGET {
-                self.feature_samples.remove(0);
-            }
+        if features.confidence < 0.72 || features.blink {
+            return None;
+        }
+        let settle_until = self
+            .settle_until_ms
+            .get_or_insert(timestamp_ms.saturating_add(900));
+        if timestamp_ms < *settle_until {
+            return None;
+        }
+        self.feature_samples.push(features);
+        if self.feature_samples.len() < CALIBRATION_SAMPLES_PER_TARGET {
             return None;
         }
 
@@ -276,7 +280,7 @@ impl CalibrationWizard {
         }
 
         if !mapping && self.current == self.validation_targets.len() {
-            let (profile, errors) = match &self.phase {
+            let (mut profile, errors) = match &self.phase {
                 CalibrationPhase::Validation { profile, errors } => {
                     (profile.clone(), errors.clone())
                 }
@@ -284,11 +288,22 @@ impl CalibrationWizard {
             };
             let median_error = median_f64(errors);
             if median_error <= self.maximum_validation_error_px {
-                return Some(CalibrationOutcome::Completed(profile));
+                let median_error_cm = median_error / self.pixels_per_cm;
+                profile.validation_median_error_px = median_error;
+                profile.validation_median_error_cm = median_error_cm;
+                profile.validation_passed = true;
+                return Some(CalibrationOutcome::Completed {
+                    profile,
+                    validation_median_error_px: median_error,
+                    validation_median_error_cm: median_error_cm,
+                });
             }
             return Some(CalibrationOutcome::Rejected(format!(
-                "Validation failed: median target error was {:.0}px (limit {:.0}px). Repeat calibration and follow each dot.",
-                median_error, self.maximum_validation_error_px
+                "Validation failed: median target error was {:.0}px ({:.2}cm); limit is {:.0}px ({:.2}cm). Repeat calibration and follow each dot.",
+                median_error,
+                median_error / self.pixels_per_cm,
+                self.maximum_validation_error_px,
+                self.maximum_validation_error_px / self.pixels_per_cm,
             )));
         }
         None
@@ -393,15 +408,15 @@ impl EyeOsApp {
 
         if !app.simulate_gaze
             && app.model == ModelStatus::Ready
-            && app.calibration.is_some()
+            && app.has_validated_calibration()
             && app.config.live_input_confirmed
         {
             app.input.set_dry_run(false);
             let events = app.engine.set_paused(false);
             app.process_events(events);
         } else if !app.simulate_gaze {
-            app.status_message = if app.calibration.is_none() {
-                "Tracker starting — complete the one-time 9-point calibration.".to_owned()
+            app.status_message = if !app.has_validated_calibration() {
+                "Tracker starting — complete the 25-point gaze-vector calibration and independent validation.".to_owned()
             } else {
                 "Paused: caregiver confirmation is required before live input.".to_owned()
             };
@@ -413,6 +428,12 @@ impl EyeOsApp {
         if let Err(error) = self.input.dispatch(action) {
             self.status_message = format!("Input was not sent: {error}");
         }
+    }
+
+    fn has_validated_calibration(&self) -> bool {
+        self.calibration
+            .as_ref()
+            .is_some_and(|profile| profile.validation_passed)
     }
 
     fn process_events(&mut self, events: Vec<EngineEvent>) {
@@ -482,7 +503,7 @@ impl EyeOsApp {
     }
 
     fn toggle_tracking(&mut self) {
-        if self.model != ModelStatus::Ready || self.calibration.is_none() {
+        if self.model != ModelStatus::Ready || !self.has_validated_calibration() {
             self.status_message =
                 "Tracking cannot start until a local model and calibration are available."
                     .to_owned();
@@ -505,7 +526,7 @@ impl EyeOsApp {
         }
         let can_resume = self.simulate_gaze
             || (self.model == ModelStatus::Ready
-                && self.calibration.is_some()
+                && self.has_validated_calibration()
                 && self.config.live_input_confirmed
                 && !self.input.is_dry_run());
         if can_resume {
@@ -1014,8 +1035,12 @@ impl EyeOsApp {
         ui.separator();
         if let Some(profile) = &self.calibration {
             ui.label(format!(
-                "Encrypted calibration profile: {} samples, median fit error {:.1}px.",
-                profile.sample_count, profile.median_error_px
+                "Gaze-vector calibration: {} samples, fit median {:.1}px; independent validation {:.1}px / {:.2}cm ({}).",
+                profile.sample_count,
+                profile.median_error_px,
+                profile.validation_median_error_px,
+                profile.validation_median_error_cm,
+                if profile.validation_passed { "passed" } else { "not passed" },
             ));
         } else {
             ui.label("No calibration profile is stored yet.");
@@ -1030,8 +1055,14 @@ impl EyeOsApp {
             );
         }
         ui.add_enabled_ui(ready_for_calibration, |ui| {
-            if ui.button("Start 9-point calibration").clicked() {
-                self.calibration_wizard = Some(CalibrationWizard::new(self.screen_size));
+            if ui
+                .button("Start 25-point gaze-vector calibration")
+                .clicked()
+            {
+                self.calibration_wizard = Some(CalibrationWizard::new(
+                    self.screen_size,
+                    primary_pixels_per_cm(),
+                ));
                 self.status_message =
                     "Look at each target until EyeOS moves to the next one.".to_owned();
                 self.set_page(Page::Calibration, context);
@@ -1040,7 +1071,7 @@ impl EyeOsApp {
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
         }
-        if self.calibration.is_some() && ui.button("Open EyeOS desktop blob").clicked() {
+        if self.has_validated_calibration() && ui.button("Open EyeOS desktop blob").clicked() {
             self.set_page(Page::Overlay, context);
         }
         ui.separator();
@@ -1085,7 +1116,7 @@ impl EyeOsApp {
             Pos2::new(rect.center().x, 82.0),
             Align2::CENTER_CENTER,
             format!(
-                "Hold the dot until ready: {}/{} samples — then blink both eyes to capture",
+                "Hold your gaze on the dot: {}/{} stable gaze-vector samples",
                 wizard.sample_progress(),
                 CALIBRATION_SAMPLES_PER_TARGET
             ),
@@ -1106,7 +1137,7 @@ impl EyeOsApp {
         ui.checkbox(&mut self.config.sound_feedback, "Audio feedback");
         ui.separator();
         ui.label(RichText::new("Live desktop input").strong());
-        let model_ready = self.model == ModelStatus::Ready && self.calibration.is_some();
+        let model_ready = self.model == ModelStatus::Ready && self.has_validated_calibration();
         ui.add_enabled_ui(model_ready, |ui| {
             ui.checkbox(
                 &mut self.config.live_input_confirmed,
@@ -1181,22 +1212,26 @@ impl EyeOsApp {
                         .and_then(|wizard| wizard.observe(features, timestamp_ms));
                     if let Some(outcome) = calibration_outcome {
                         match outcome {
-                            CalibrationOutcome::Completed(calibration) => {
-                                match self.store.save_calibration(&calibration) {
-                                    Ok(()) => {
-                                        self.calibration = Some(calibration);
-                                        self.calibration_wizard = None;
-                                        self.status_message = "Calibration and independent five-target validation passed. A caregiver can now enable live input.".to_owned();
-                                        self.set_page(Page::Setup, context);
-                                    }
-                                    Err(error) => {
-                                        self.calibration_wizard = None;
-                                        self.status_message =
-                                            format!("Could not save calibration: {error}");
-                                        self.set_page(Page::Setup, context);
-                                    }
+                            CalibrationOutcome::Completed {
+                                profile: calibration,
+                                validation_median_error_px,
+                                validation_median_error_cm,
+                            } => match self.store.save_calibration(&calibration) {
+                                Ok(()) => {
+                                    self.calibration = Some(calibration);
+                                    self.calibration_wizard = None;
+                                    self.status_message = format!(
+                                        "Calibration passed independent validation: median error {validation_median_error_px:.0}px / {validation_median_error_cm:.2}cm."
+                                    );
+                                    self.set_page(Page::Setup, context);
                                 }
-                            }
+                                Err(error) => {
+                                    self.calibration_wizard = None;
+                                    self.status_message =
+                                        format!("Could not save calibration: {error}");
+                                    self.set_page(Page::Setup, context);
+                                }
+                            },
                             CalibrationOutcome::Rejected(message) => {
                                 self.calibration_wizard = None;
                                 self.status_message = message;
@@ -1217,6 +1252,7 @@ impl EyeOsApp {
                         status,
                         TrackerStatus::NoFace
                             | TrackerStatus::LowFrameRate { .. }
+                            | TrackerStatus::GazeUnavailable { .. }
                             | TrackerStatus::Failed(_)
                     );
                     if tracking_failed && self.engine.safety != SafetyState::Paused {
@@ -1340,7 +1376,9 @@ fn action_label(action: OverlayAction) -> &'static str {
 
 fn tracker_status_message(status: TrackerStatus) -> String {
     match status {
-        TrackerStatus::Starting => "Starting the local MediaPipe eye tracker…".to_owned(),
+        TrackerStatus::Starting => {
+            "Starting the local face, head-pose, and gaze-vector tracker…".to_owned()
+        }
         TrackerStatus::CameraReady {
             width,
             height,
@@ -1355,6 +1393,9 @@ fn tracker_status_message(status: TrackerStatus) -> String {
         TrackerStatus::Tracking { fps } => format!("Eye tracker active ({fps:.0} FPS)."),
         TrackerStatus::LowFrameRate { fps } => {
             format!("Tracking paused: webcam inference is too slow ({fps:.0} FPS).")
+        }
+        TrackerStatus::GazeUnavailable { detail } => {
+            format!("Tracking paused: gaze estimate is not reliable ({detail}).")
         }
         TrackerStatus::NoFace => "Tracking paused: face or eyes are not visible.".to_owned(),
         TrackerStatus::Failed(error) => format!("Eye tracker stopped: {error}"),
@@ -1386,6 +1427,28 @@ fn primary_screen_size() -> Point {
     }
     #[cfg(not(windows))]
     Point::new(1920.0, 1080.0)
+}
+
+/// Windows exposes the physical size reported by the primary display EDID.  Some inexpensive
+/// panels report no size; in that case use the standard 96-DPI conversion and label it only as a
+/// practical validation estimate rather than a hardware measurement.
+fn primary_pixels_per_cm() -> f64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetDC, GetDeviceCaps, HORZRES, HORZSIZE, ReleaseDC,
+        };
+        let dc = unsafe { GetDC(std::ptr::null_mut()) };
+        if !dc.is_null() {
+            let pixels = unsafe { GetDeviceCaps(dc, HORZRES as i32) };
+            let millimetres = unsafe { GetDeviceCaps(dc, HORZSIZE as i32) };
+            let _ = unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+            if pixels > 0 && millimetres > 0 {
+                return f64::from(pixels) / (f64::from(millimetres) / 10.0);
+            }
+        }
+    }
+    96.0 / 2.54
 }
 
 fn physical_cursor_position() -> Option<Point> {
@@ -1471,7 +1534,7 @@ mod tests {
 
     #[test]
     fn calibration_wizard_requires_distinct_positions_and_passes_validation() {
-        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0));
+        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0), 37.795);
         let mut timestamp_ms = 0_u64;
         for _ in 0..25 {
             let target = wizard.target().expect("calibration target");
@@ -1506,16 +1569,17 @@ mod tests {
                 timestamp_ms += 33;
             }
         }
-        let CalibrationOutcome::Completed(profile) = completed.expect("completed profile") else {
+        let CalibrationOutcome::Completed { profile, .. } = completed.expect("completed profile")
+        else {
             panic!("synthetic calibration should pass validation")
         };
         assert_eq!(profile.sample_count, 25);
-        assert!(profile.median_error_px < 0.01);
+        assert!(profile.validation_passed);
     }
 
     #[test]
     fn calibration_wizard_rejects_a_stationary_gaze() {
-        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0));
+        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0), 37.795);
         let features = EyeFeatures {
             x: 0.5,
             y: 0.5,

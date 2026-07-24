@@ -1,6 +1,7 @@
 target/
 *.exe
 *.dll
+!assets/runtime/mediapipe/libmediapipe.dll
 *.pdb
 *.ilk
 *.exp

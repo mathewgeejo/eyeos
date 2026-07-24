@@ -8,7 +8,11 @@ use eyeos::{
     InputController, InteractionMode, Point, SafetyState,
     config::AppConfig,
     persistence::{ProfileStore, install_autostart},
-    vision::{CameraStatus, ModelStatus, detect_camera_status, model_status},
+    tracker::{LocalTracker, TrackerEvent, TrackerStatus},
+    vision::{
+        CameraStatus, EyeFeatures, ModelStatus, calibrated_sample, detect_camera_status,
+        model_status,
+    },
 };
 
 const BLOB_SIZE: f32 = 80.0;
@@ -47,6 +51,7 @@ enum Page {
     Overlay,
     Actions,
     Keyboard,
+    Calibration,
     Training,
     Setup,
     Settings,
@@ -81,6 +86,89 @@ enum OverlayTarget {
     Key(KeyboardAction),
 }
 
+/// Each target settles for 900 ms, then collects 16 confident local samples. This keeps the
+/// caregiver-assisted process keyboard-free for the person being calibrated.
+struct CalibrationWizard {
+    targets: Vec<Point>,
+    samples: Vec<CalibrationPoint>,
+    current: usize,
+    settle_until_ms: Option<u64>,
+    feature_samples: Vec<EyeFeatures>,
+}
+
+impl CalibrationWizard {
+    fn new(screen_size: Point) -> Self {
+        let mut targets = Vec::with_capacity(9);
+        for y in [0.1, 0.5, 0.9] {
+            for x in [0.1, 0.5, 0.9] {
+                targets.push(Point::new(screen_size.x * x, screen_size.y * y));
+            }
+        }
+        Self {
+            targets,
+            samples: Vec::with_capacity(9),
+            current: 0,
+            settle_until_ms: None,
+            feature_samples: Vec::with_capacity(16),
+        }
+    }
+
+    fn target(&self) -> Option<Point> {
+        self.targets.get(self.current).copied()
+    }
+
+    fn progress(&self) -> (usize, usize) {
+        (self.current, self.targets.len())
+    }
+
+    fn sample_progress(&self) -> usize {
+        self.feature_samples.len()
+    }
+
+    fn observe(&mut self, features: EyeFeatures, timestamp_ms: u64) -> Option<CalibrationProfile> {
+        if features.confidence < 0.72 || self.current >= self.targets.len() {
+            return None;
+        }
+        let settle_until = self
+            .settle_until_ms
+            .get_or_insert(timestamp_ms.saturating_add(900));
+        if timestamp_ms < *settle_until {
+            return None;
+        }
+        self.feature_samples.push(features);
+        if self.feature_samples.len() < 16 {
+            return None;
+        }
+
+        let count = self.feature_samples.len() as f64;
+        let feature_x = self
+            .feature_samples
+            .iter()
+            .map(|sample| sample.x)
+            .sum::<f64>()
+            / count;
+        let feature_y = self
+            .feature_samples
+            .iter()
+            .map(|sample| sample.y)
+            .sum::<f64>()
+            / count;
+        let target = self.targets[self.current];
+        self.samples.push(CalibrationPoint {
+            feature_x,
+            feature_y,
+            screen_x: target.x,
+            screen_y: target.y,
+        });
+        self.current += 1;
+        self.feature_samples.clear();
+        self.settle_until_ms = Some(timestamp_ms.saturating_add(900));
+        (self.current == self.targets.len())
+            .then(|| CalibrationProfile::fit(&self.samples))
+            .flatten()
+    }
+}
+
 struct EyeOsApp {
     store: ProfileStore,
     config: AppConfig,
@@ -96,6 +184,9 @@ struct EyeOsApp {
     status_message: String,
     dwell_progress: f32,
     calibration: Option<CalibrationProfile>,
+    tracker: Option<LocalTracker>,
+    latest_features: Option<(EyeFeatures, u64)>,
+    calibration_wizard: Option<CalibrationWizard>,
     overlay_target: Option<OverlayTarget>,
     overlay_target_started_at: Option<u64>,
     overlay_cooldown_until: u64,
@@ -125,6 +216,9 @@ impl EyeOsApp {
             status_message: "Looking for the local eye tracker…".to_owned(),
             dwell_progress: 0.0,
             calibration,
+            tracker: None,
+            latest_features: None,
+            calibration_wizard: None,
             overlay_target: None,
             overlay_target_started_at: None,
             overlay_cooldown_until: 0,
@@ -138,12 +232,30 @@ impl EyeOsApp {
             let events = app.engine.set_paused(false);
             app.process_events(events);
             app.status_message = "Developer gaze simulation — dry-run only.".to_owned();
-        } else if app.model == ModelStatus::Ready && app.calibration.is_some() {
+        } else {
+            match LocalTracker::start(app.store.root().to_path_buf(), app.config.camera_index) {
+                Ok(tracker) => app.tracker = Some(tracker),
+                Err(error) => {
+                    app.status_message = format!("Eye tracker could not start: {error}");
+                    return app;
+                }
+            }
+        }
+
+        if !app.simulate_gaze
+            && app.model == ModelStatus::Ready
+            && app.calibration.is_some()
+            && app.config.live_input_confirmed
+        {
             app.input.set_dry_run(false);
             let events = app.engine.set_paused(false);
             app.process_events(events);
-        } else {
-            app.status_message = "Paused: complete the one-time caregiver setup first.".to_owned();
+        } else if !app.simulate_gaze {
+            app.status_message = if app.calibration.is_none() {
+                "Tracker starting — complete the one-time 9-point calibration.".to_owned()
+            } else {
+                "Paused: caregiver confirmation is required before live input.".to_owned()
+            };
         }
         app
     }
@@ -208,6 +320,10 @@ impl EyeOsApp {
                     (self.screen_size.y as f32 - KEYBOARD_HEIGHT - OVERLAY_MARGIN).max(0.0),
                 ),
             ),
+            Page::Calibration => (
+                Vec2::new(self.screen_size.x as f32, self.screen_size.y as f32),
+                Pos2::ZERO,
+            ),
             Page::Training | Page::Setup | Page::Settings => {
                 (Vec2::new(620.0, 620.0), Pos2::new(80.0, 80.0))
             }
@@ -229,8 +345,24 @@ impl EyeOsApp {
     }
 
     fn select_mode(&mut self, mode: InteractionMode) {
+        self.resume_tracking_after_intent();
         self.engine.set_mode(mode);
         self.status_message = format!("{} selected.", mode_label(mode));
+    }
+
+    fn resume_tracking_after_intent(&mut self) {
+        if self.engine.safety == SafetyState::Tracking {
+            return;
+        }
+        let can_resume = self.simulate_gaze
+            || (self.model == ModelStatus::Ready
+                && self.calibration.is_some()
+                && self.config.live_input_confirmed
+                && !self.input.is_dry_run());
+        if can_resume {
+            let events = self.engine.set_paused(false);
+            self.process_events(events);
+        }
     }
 
     /// This is the single entry point for real tracker samples. A future tracker must call this
@@ -275,7 +407,7 @@ impl EyeOsApp {
                     self.clear_overlay_target();
                 }
             }
-            Page::Training | Page::Setup | Page::Settings => {}
+            Page::Calibration | Page::Training | Page::Setup | Page::Settings => {}
         }
     }
 
@@ -344,7 +476,8 @@ impl EyeOsApp {
                 return;
             }
             OverlayAction::Pause => {
-                let events = self.engine.set_paused(true);
+                let pause = self.engine.safety == SafetyState::Tracking;
+                let events = self.engine.set_paused(pause);
                 self.process_events(events);
             }
         }
@@ -733,21 +866,17 @@ impl EyeOsApp {
         } else {
             ui.label("No calibration profile is stored yet.");
         }
-        ui.add_enabled_ui(self.model == ModelStatus::Ready, |ui| {
-            if ui.button("Save 9-point calibration").clicked() {
-                let profile = demo_calibration();
-                match self.store.save_calibration(&profile) {
-                    Ok(()) => {
-                        self.calibration = Some(profile);
-                        self.status_message =
-                            "Calibration saved with Windows DPAPI encryption.".to_owned();
-                    }
-                    Err(error) => {
-                        self.status_message = format!("Could not save calibration: {error}")
-                    }
+        ui.add_enabled_ui(
+            self.model == ModelStatus::Ready && self.tracker.is_some(),
+            |ui| {
+                if ui.button("Start 9-point calibration").clicked() {
+                    self.calibration_wizard = Some(CalibrationWizard::new(self.screen_size));
+                    self.status_message =
+                        "Look at each target until EyeOS moves to the next one.".to_owned();
+                    self.set_page(Page::Calibration, context);
                 }
-            }
-        });
+            },
+        );
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
         }
@@ -755,6 +884,42 @@ impl EyeOsApp {
         if ui.button("Open accessibility settings").clicked() {
             self.set_page(Page::Settings, context);
         }
+    }
+
+    fn render_calibration(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.max_rect();
+        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+        let Some(wizard) = &self.calibration_wizard else {
+            return;
+        };
+        let Some(target) = wizard.target() else {
+            return;
+        };
+        let (completed, total) = wizard.progress();
+        let target_position = Pos2::new(target.x as f32, target.y as f32);
+        let target_colour = if self.config.high_contrast {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(68, 230, 188)
+        };
+        ui.painter()
+            .circle_filled(target_position, 28.0, target_colour);
+        ui.painter()
+            .circle_stroke(target_position, 42.0, Stroke::new(4.0_f32, Color32::WHITE));
+        ui.painter().text(
+            Pos2::new(rect.center().x, 48.0),
+            Align2::CENTER_CENTER,
+            format!("Look at the target  •  {} of {}", completed + 1, total),
+            FontId::proportional(26.0),
+            Color32::WHITE,
+        );
+        ui.painter().text(
+            Pos2::new(rect.center().x, 82.0),
+            Align2::CENTER_CENTER,
+            format!("Capturing stable samples: {}/16", wizard.sample_progress()),
+            FontId::proportional(18.0),
+            Color32::from_gray(210),
+        );
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
@@ -818,11 +983,80 @@ impl EyeOsApp {
         };
         self.process_gaze_sample(sample, context);
     }
+
+    fn poll_tracker(&mut self, context: &egui::Context) {
+        let events = self
+            .tracker
+            .as_ref()
+            .map(LocalTracker::drain)
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                TrackerEvent::Features {
+                    features,
+                    timestamp_ms,
+                } => {
+                    self.latest_features = Some((features, timestamp_ms));
+                    let completed_calibration = self
+                        .calibration_wizard
+                        .as_mut()
+                        .and_then(|wizard| wizard.observe(features, timestamp_ms));
+                    if let Some(calibration) = completed_calibration {
+                        match self.store.save_calibration(&calibration) {
+                            Ok(()) => {
+                                self.calibration = Some(calibration);
+                                self.calibration_wizard = None;
+                                self.status_message =
+                                    "Calibration saved. A caregiver can now enable live input."
+                                        .to_owned();
+                                self.set_page(Page::Setup, context);
+                            }
+                            Err(error) => {
+                                self.calibration_wizard = None;
+                                self.status_message =
+                                    format!("Could not save calibration: {error}");
+                                self.set_page(Page::Setup, context);
+                            }
+                        }
+                    } else if self.calibration_wizard.is_none() {
+                        if let Some(calibration) = &self.calibration {
+                            self.process_gaze_sample(
+                                calibrated_sample(features, calibration, timestamp_ms),
+                                context,
+                            );
+                        }
+                    }
+                }
+                TrackerEvent::Status(status) => {
+                    let tracking_failed = matches!(
+                        status,
+                        TrackerStatus::NoFace
+                            | TrackerStatus::LowFrameRate { .. }
+                            | TrackerStatus::Failed(_)
+                    );
+                    if tracking_failed && self.engine.safety != SafetyState::Paused {
+                        let timestamp_ms = self
+                            .latest_features
+                            .map(|(_, timestamp_ms)| timestamp_ms)
+                            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
+                        let events = self.engine.update(GazeSample {
+                            position: Point::default(),
+                            confidence: 0.0,
+                            timestamp_ms,
+                        });
+                        self.process_events(events);
+                    }
+                    self.status_message = tracker_status_message(status);
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for EyeOsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(Duration::from_millis(16));
+        self.poll_tracker(context);
         self.maybe_run_cursor_simulator(context);
         if self.config.high_contrast {
             context.set_visuals(egui::Visuals::dark());
@@ -852,6 +1086,11 @@ impl eframe::App for EyeOsApp {
                         self.render_keyboard_overlay(ui, context);
                     });
             }
+            Page::Calibration => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(context, |ui| self.render_calibration(ui));
+            }
             Page::Training => {
                 egui::CentralPanel::default().show(context, |ui| self.render_training(ui, context));
             }
@@ -866,6 +1105,10 @@ impl eframe::App for EyeOsApp {
         if context.input(|input| input.key_pressed(egui::Key::Escape)) {
             match self.page {
                 Page::Overlay => self.toggle_tracking(),
+                Page::Calibration => {
+                    self.calibration_wizard = None;
+                    self.set_page(Page::Setup, context);
+                }
                 _ => self.set_page(Page::Overlay, context),
             }
         }
@@ -906,7 +1149,23 @@ fn action_label(action: OverlayAction) -> &'static str {
         OverlayAction::Keyboard => "TYPE",
         OverlayAction::Training => "PRACTICE",
         OverlayAction::Calibrate => "SETUP",
-        OverlayAction::Pause => "PAUSE",
+        OverlayAction::Pause => "PAUSE\nRESUME",
+    }
+}
+
+fn tracker_status_message(status: TrackerStatus) -> String {
+    match status {
+        TrackerStatus::Starting => "Starting the local MediaPipe eye tracker…".to_owned(),
+        TrackerStatus::CameraReady { width, height } => {
+            format!("Camera ready at {width}×{height}; looking for a face.")
+        }
+        TrackerStatus::Tracking { fps } => format!("Eye tracker active ({fps:.0} FPS)."),
+        TrackerStatus::LowFrameRate { fps } => {
+            format!("Tracking paused: webcam inference is too slow ({fps:.0} FPS).")
+        }
+        TrackerStatus::NoFace => "Tracking paused: face or eyes are not visible.".to_owned(),
+        TrackerStatus::Failed(error) => format!("Eye tracker stopped: {error}"),
+        TrackerStatus::Stopped => "Eye tracker stopped.".to_owned(),
     }
 }
 
@@ -920,21 +1179,6 @@ fn mode_label(mode: InteractionMode) -> &'static str {
         InteractionMode::Scroll => "Scroll mode",
         InteractionMode::Keyboard => "Keyboard mode",
     }
-}
-
-fn demo_calibration() -> CalibrationProfile {
-    let mut samples = Vec::new();
-    for y in [0.1, 0.5, 0.9] {
-        for x in [0.1, 0.5, 0.9] {
-            samples.push(CalibrationPoint {
-                feature_x: x,
-                feature_y: y,
-                screen_x: x * 1920.0,
-                screen_y: y * 1080.0,
-            });
-        }
-    }
-    CalibrationProfile::fit(&samples).expect("nine non-collinear calibration samples")
 }
 
 fn primary_screen_size() -> Point {
@@ -996,6 +1240,7 @@ fn run() -> Result<()> {
             Vec2::new(KEYBOARD_WIDTH, KEYBOARD_HEIGHT),
             [OVERLAY_MARGIN, 600.0],
         ),
+        Page::Calibration => (Vec2::new(1920.0, 1080.0), [0.0, 0.0]),
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1024,5 +1269,35 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("EyeOS could not start: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibration_wizard_fits_from_observed_eye_features() {
+        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0));
+        let mut completed = None;
+        let mut timestamp_ms = 0_u64;
+        while wizard.target().is_some() {
+            let target = wizard.target().expect("calibration target");
+            let features = EyeFeatures {
+                x: target.x / 1_920.0,
+                y: target.y / 1_080.0,
+                confidence: 1.0,
+                one_eye_fallback: false,
+            };
+            assert!(wizard.observe(features, timestamp_ms).is_none());
+            timestamp_ms += 1_000;
+            for _ in 0..16 {
+                completed = wizard.observe(features, timestamp_ms);
+                timestamp_ms += 33;
+            }
+        }
+        let profile = completed.expect("completed profile");
+        assert_eq!(profile.sample_count, 9);
+        assert!(profile.median_error_px < 0.01);
     }
 }

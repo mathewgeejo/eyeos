@@ -6,6 +6,7 @@ pub mod config;
 pub mod gaze;
 pub mod input;
 pub mod persistence;
+pub mod tracker;
 pub mod vision;
 
 pub use calibration::{CalibrationPoint, CalibrationProfile};

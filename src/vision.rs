@@ -2,9 +2,20 @@
 //! adapter is deliberately separate from the control engine so replacing model weights cannot
 //! accidentally change dwell or input safety rules.
 
+use std::sync::OnceLock;
+
+use sha2::{Digest, Sha256};
+
 use crate::gaze::GazeSample;
 
 pub const LANDMARK_COUNT: usize = 478;
+pub const FACE_LANDMARKER_MODEL_SHA256: &str =
+    "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff";
+const FACE_LANDMARKER_MODEL: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/assets/models/face_landmarker.task"
+));
+static MODEL_STATUS: OnceLock<ModelStatus> = OnceLock::new();
 const LEFT_IRIS: std::ops::Range<usize> = 468..473;
 const RIGHT_IRIS: std::ops::Range<usize> = 473..478;
 const LEFT_EYE_OUTER: usize = 33;
@@ -105,6 +116,13 @@ pub fn calibrated_sample(
     }
 }
 
+/// The official Face Landmarker task bundle is compiled into EyeOS. The tracker passes these
+/// bytes directly to the MediaPipe C API, so the model is never downloaded or read from a
+/// mutable location at runtime.
+pub fn embedded_face_landmarker_model() -> &'static [u8] {
+    FACE_LANDMARKER_MODEL
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CameraStatus {
     NotStarted,
@@ -144,9 +162,23 @@ pub enum ModelStatus {
 }
 
 pub fn model_status() -> ModelStatus {
-    // The included NOTICE documents why model weights are intentionally not downloaded at run
-    // time. Enabling the `onnx` feature is not enough: the reviewed asset must also be bundled.
-    ModelStatus::NotBundled
+    *MODEL_STATUS.get_or_init(|| {
+        let hash = Sha256::digest(FACE_LANDMARKER_MODEL);
+        if hex_lower(&hash) == FACE_LANDMARKER_MODEL_SHA256 {
+            ModelStatus::Ready
+        } else {
+            ModelStatus::NotBundled
+        }
+    })
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 #[cfg(test)]
@@ -202,5 +234,10 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn bundled_model_matches_its_pinned_hash() {
+        assert_eq!(model_status(), ModelStatus::Ready);
     }
 }

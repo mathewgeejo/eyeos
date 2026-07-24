@@ -18,10 +18,10 @@ Caregiver-only surfaces remain available through `--setup` and `--training`. The
 uses dry-run input. Live desktop input is enabled only after a reviewed local model and saved
 calibration are present; if either is absent, EyeOS stays paused instead of guessing.
 
-The gaze pipeline accepts 478-point face/iris landmarks through `vision::LandmarkFrame`.
-The repository intentionally does not bundle a third-party model weight until its source,
-licence, conversion reproducibility, and evaluation are recorded in `assets/models/NOTICE.md`.
-This avoids pretending that a placeholder model is safe or accurate enough for assistive use.
+EyeOS now embeds a pinned official MediaPipe Face Landmarker task bundle and the matching Windows
+MediaPipe C runtime. The webcam worker uses the 478 local face/iris landmarks to feed the gaze
+calibration and dwell-control engine. Model and runtime hashes are checked before use, and their
+source/provenance is recorded in [`assets/models/NOTICE.md`](assets/models/NOTICE.md).
 
 ## Build
 
@@ -43,6 +43,11 @@ eyeos.exe --setup          Open caregiver calibration/setup.
 eyeos.exe --install-autostart
 eyeos.exe --reset-profile
 ```
+
+First-time caregiver setup: run `eyeos.exe --setup`, start the 9-point calibration, let the
+intended user look at each target until it advances, then enable live input in Accessibility and
+safety settings. The tracker uses CPU inference on-device; it sends no webcam frames to EyeOS
+servers or a cloud service.
 
 For developer verification only, `eyeos.exe --simulate-gaze` maps the physical mouse position
 through the gaze state machine in dry-run mode. It never sends input to another application.

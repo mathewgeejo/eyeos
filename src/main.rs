@@ -835,6 +835,11 @@ impl EyeOsApp {
 
     fn render_setup(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         self.render_full_header(ui, context, "Caregiver setup and calibration");
+        ui.group(|ui| {
+            ui.label(RichText::new("Live tracker status").strong());
+            ui.label(&self.status_message);
+        });
+        ui.add_space(6.0);
         ui.label("Place the camera at eye height with even lighting. Calibration must be completed by the intended user.");
         match &self.camera {
             CameraStatus::Available { devices } => ui.colored_label(
@@ -866,17 +871,23 @@ impl EyeOsApp {
         } else {
             ui.label("No calibration profile is stored yet.");
         }
-        ui.add_enabled_ui(
-            self.model == ModelStatus::Ready && self.tracker.is_some(),
-            |ui| {
-                if ui.button("Start 9-point calibration").clicked() {
-                    self.calibration_wizard = Some(CalibrationWizard::new(self.screen_size));
-                    self.status_message =
-                        "Look at each target until EyeOS moves to the next one.".to_owned();
-                    self.set_page(Page::Calibration, context);
-                }
-            },
-        );
+        let ready_for_calibration = self.model == ModelStatus::Ready
+            && self.tracker.is_some()
+            && self.has_recent_eye_features();
+        if !ready_for_calibration {
+            ui.colored_label(
+                Color32::YELLOW,
+                "Waiting for a usable camera and face/iris stream before calibration can begin.",
+            );
+        }
+        ui.add_enabled_ui(ready_for_calibration, |ui| {
+            if ui.button("Start 9-point calibration").clicked() {
+                self.calibration_wizard = Some(CalibrationWizard::new(self.screen_size));
+                self.status_message =
+                    "Look at each target until EyeOS moves to the next one.".to_owned();
+                self.set_page(Page::Calibration, context);
+            }
+        });
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
         }
@@ -982,6 +993,12 @@ impl EyeOsApp {
             timestamp_ms: self.started_at.elapsed().as_millis() as u64,
         };
         self.process_gaze_sample(sample, context);
+    }
+
+    fn has_recent_eye_features(&self) -> bool {
+        let now_ms = self.started_at.elapsed().as_millis() as u64;
+        self.latest_features
+            .is_some_and(|(_, timestamp_ms)| now_ms.saturating_sub(timestamp_ms) <= 2_000)
     }
 
     fn poll_tracker(&mut self, context: &egui::Context) {
@@ -1156,8 +1173,16 @@ fn action_label(action: OverlayAction) -> &'static str {
 fn tracker_status_message(status: TrackerStatus) -> String {
     match status {
         TrackerStatus::Starting => "Starting the local MediaPipe eye tracker…".to_owned(),
-        TrackerStatus::CameraReady { width, height } => {
-            format!("Camera ready at {width}×{height}; looking for a face.")
+        TrackerStatus::CameraReady {
+            width,
+            height,
+            fps,
+            format,
+        } => format!(
+            "Camera streaming at {width}×{height}, {fps} FPS ({format}); looking for a face."
+        ),
+        TrackerStatus::CameraRetrying { attempt, detail } => {
+            format!("Camera is reconnecting (attempt {attempt}): {detail}")
         }
         TrackerStatus::Tracking { fps } => format!("Eye tracker active ({fps:.0} FPS)."),
         TrackerStatus::LowFrameRate { fps } => {

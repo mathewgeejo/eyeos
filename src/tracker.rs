@@ -9,9 +9,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,9 +33,22 @@ const MEDIAPIPE_RUNTIME: &[u8] = include_bytes!(concat!(
 #[derive(Debug, Clone)]
 pub enum TrackerStatus {
     Starting,
-    CameraReady { width: u32, height: u32 },
-    Tracking { fps: f32 },
-    LowFrameRate { fps: f32 },
+    CameraReady {
+        width: u32,
+        height: u32,
+        fps: u32,
+        format: String,
+    },
+    CameraRetrying {
+        attempt: u32,
+        detail: String,
+    },
+    Tracking {
+        fps: f32,
+    },
+    LowFrameRate {
+        fps: f32,
+    },
     NoFace,
     Failed(String),
     Stopped,
@@ -138,6 +151,7 @@ fn run_worker(
             let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::Stopped));
         }
         Err(error) => {
+            eprintln!("[EyeOS tracker] {error:#}");
             let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::Failed(
                 error.to_string(),
             )));
@@ -153,46 +167,105 @@ fn run_worker_inner(
     stop_rx: &Receiver<()>,
 ) -> Result<()> {
     use nokhwa::{
-        Camera,
         pixel_format::RgbFormat,
-        utils::{
-            CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-            Resolution,
-        },
+        utils::{CameraIndex, RequestedFormat, RequestedFormatType},
     };
 
     let landmarker = MediaPipeFaceLandmarker::load(runtime_path)?;
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(
-        CameraFormat::new(Resolution::new(1280, 720), FrameFormat::MJPEG, 30),
-    ));
-    let mut camera = Camera::new(CameraIndex::Index(camera_index), requested)
-        .map_err(|error| anyhow!("opening webcam {camera_index}: {error}"))?;
+    let mut attempt = 0_u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        let requested = if attempt % 2 == 1 {
+            // Do not force MJPEG. Integrated webcams commonly expose only NV12 or YUYV.
+            // RgbFormat accepts all of those formats and asks Windows for the best 30-FPS
+            // option, which is the practical baseline for responsive gaze control.
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::HighestFrameRate(30))
+        } else {
+            // A few webcams do not publish an exact 30-FPS mode. On retry, accept their
+            // fastest RGB-decodable format rather than treating a detected camera as usable.
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate)
+        };
+
+        match run_capture_session(
+            &landmarker,
+            CameraIndex::Index(camera_index),
+            requested,
+            event_tx,
+            stop_rx,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let detail = format!("Camera attempt {attempt} failed: {error:#}");
+                eprintln!("[EyeOS tracker] {detail}");
+                let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::CameraRetrying {
+                    attempt,
+                    detail,
+                }));
+                match stop_rx.recv_timeout(Duration::from_millis(900)) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Opens one capture session. A transient camera read failure ends this session so the owning
+/// worker can fully release Media Foundation and reopen it with a fresh format negotiation.
+#[cfg(feature = "camera")]
+fn run_capture_session(
+    landmarker: &MediaPipeFaceLandmarker,
+    camera_index: nokhwa::utils::CameraIndex,
+    requested: nokhwa::utils::RequestedFormat<'static>,
+    event_tx: &Sender<TrackerEvent>,
+    stop_rx: &Receiver<()>,
+) -> Result<()> {
+    use nokhwa::{Camera, pixel_format::RgbFormat};
+
+    let mut camera = Camera::new(camera_index, requested)
+        .map_err(|error| anyhow!("opening the webcam: {error}"))?;
     camera
         .open_stream()
-        .map_err(|error| anyhow!("starting webcam {camera_index}: {error}"))?;
+        .map_err(|error| anyhow!("starting the webcam stream: {error}"))?;
     let resolution = camera.resolution();
     let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::CameraReady {
         width: resolution.width_x,
         height: resolution.height_y,
+        fps: camera.frame_rate(),
+        format: camera.frame_format().to_string(),
     }));
 
     let started = Instant::now();
     let mut measured_at = started;
     let mut completed_frames = 0_u32;
     let mut last_no_face_at = started;
+    let mut consecutive_frame_errors = 0_u8;
     loop {
         match stop_rx.try_recv() {
             Ok(()) | Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => {}
         }
 
-        let frame = camera
-            .frame()
-            .map_err(|error| anyhow!("reading webcam frame: {error}"))?;
+        let frame = match camera.frame() {
+            Ok(frame) => {
+                consecutive_frame_errors = 0;
+                frame
+            }
+            Err(error) => {
+                consecutive_frame_errors = consecutive_frame_errors.saturating_add(1);
+                if consecutive_frame_errors < 5 {
+                    thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
+                return Err(anyhow!(
+                    "the webcam did not provide a frame after {consecutive_frame_errors} retries: {error}"
+                ));
+            }
+        };
         let resolution = frame.resolution();
         let rgb = frame
             .decode_image::<RgbFormat>()
-            .map_err(|error| anyhow!("converting webcam frame to RGB: {error}"))?;
+            .map_err(|error| anyhow!("converting the webcam frame to RGB: {error}"))?;
         let timestamp_ms = started.elapsed().as_millis() as u64;
         match landmarker.detect_rgb(
             rgb.as_raw(),

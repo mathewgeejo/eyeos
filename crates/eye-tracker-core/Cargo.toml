@@ -1,0 +1,12 @@
+[package]
+name = "eye-tracker-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Portable, local calibration and retrieval engine for webcam gaze tracking"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+

@@ -8,6 +8,7 @@ use eyeos::{
     CalibrationProfile, ControlEngine, EngineEvent, EyeTracker, GazeSample, InputAction,
     InputController, InteractionMode, Point, SafetyState, TrackerConfig, TrackingState,
     config::AppConfig,
+    display::{DisplayGeometry, physical_to_logical, primary_display_geometry},
     persistence::{ProfileStore, install_autostart},
     tracker::TrackerStatus,
     vision::{CameraStatus, EyeFeatures, ModelStatus, detect_camera_status, model_status},
@@ -52,7 +53,6 @@ enum Page {
     Calibration,
     Training,
     Setup,
-    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,10 +104,20 @@ struct EyeOsApp {
     overlay_target: Option<OverlayTarget>,
     overlay_target_started_at: Option<u64>,
     overlay_cooldown_until: u64,
+    detected_display: Option<DisplayGeometry>,
+    gaze_preview: Option<Point>,
 }
 
 impl EyeOsApp {
-    fn new(store: ProfileStore, config: AppConfig, page: Page, simulate_gaze: bool) -> Self {
+    fn new(store: ProfileStore, mut config: AppConfig, page: Page, simulate_gaze: bool) -> Self {
+        let detected_display = primary_display_geometry();
+        if let Some(display) = &detected_display {
+            if config.screen_width_mm.is_none() && config.screen_height_mm.is_none() {
+                config.screen_width_mm = Some(display.size_mm.x);
+                config.screen_height_mm = Some(display.size_mm.y);
+                let _ = store.save_config(&config);
+            }
+        }
         let screen_size = primary_screen_size();
         let mut engine = ControlEngine::new(screen_size.x, screen_size.y);
         engine.dwell_ms = config.dwell_ms;
@@ -148,6 +158,8 @@ impl EyeOsApp {
             overlay_target: None,
             overlay_target_started_at: None,
             overlay_cooldown_until: 0,
+            detected_display,
+            gaze_preview: None,
         };
 
         // A user who has a reviewed local model and a saved calibration should not need a
@@ -183,6 +195,9 @@ impl EyeOsApp {
             } else {
                 "Paused: caregiver confirmation is required before live input.".to_owned()
             };
+        }
+        if app.page == Page::Overlay && app.calibration.is_none() && !app.simulate_gaze {
+            app.page = Page::Setup;
         }
         app
     }
@@ -236,35 +251,46 @@ impl EyeOsApp {
     fn set_page(&mut self, page: Page, context: &egui::Context) {
         self.page = page;
         self.clear_overlay_target();
+        let fullscreen = matches!(page, Page::Setup | Page::Calibration);
+        context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Transparent(!fullscreen));
+        if fullscreen {
+            let screen = primary_ui_size();
+            context.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(
+                screen.x as f32,
+                screen.y as f32,
+            )));
+            context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(Pos2::ZERO));
+            return;
+        }
+        let screen = physical_to_logical(self.screen_size, context.pixels_per_point());
         let (size, position) = match page {
             Page::Overlay => (
                 Vec2::splat(BLOB_SIZE),
                 Pos2::new(
                     OVERLAY_MARGIN,
-                    (self.screen_size.y as f32 - BLOB_SIZE - OVERLAY_MARGIN).max(0.0),
+                    (screen.y as f32 - BLOB_SIZE - OVERLAY_MARGIN).max(0.0),
                 ),
             ),
             Page::Actions => (
                 Vec2::splat(PANEL_SIZE),
                 Pos2::new(
                     OVERLAY_MARGIN,
-                    (self.screen_size.y as f32 - PANEL_SIZE - OVERLAY_MARGIN).max(0.0),
+                    (screen.y as f32 - PANEL_SIZE - OVERLAY_MARGIN).max(0.0),
                 ),
             ),
             Page::Keyboard => (
                 Vec2::new(KEYBOARD_WIDTH, KEYBOARD_HEIGHT),
                 Pos2::new(
                     OVERLAY_MARGIN,
-                    (self.screen_size.y as f32 - KEYBOARD_HEIGHT - OVERLAY_MARGIN).max(0.0),
+                    (screen.y as f32 - KEYBOARD_HEIGHT - OVERLAY_MARGIN).max(0.0),
                 ),
             ),
             Page::Calibration => (
                 Vec2::new(self.screen_size.x as f32, self.screen_size.y as f32),
                 Pos2::ZERO,
             ),
-            Page::Training | Page::Setup | Page::Settings => {
-                (Vec2::new(620.0, 620.0), Pos2::new(80.0, 80.0))
-            }
+            Page::Training | Page::Setup => (Vec2::new(620.0, 620.0), Pos2::new(80.0, 80.0)),
         };
         context.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
         context.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
@@ -277,6 +303,12 @@ impl EyeOsApp {
                     .to_owned();
             return;
         }
+        if !self.config.live_input_confirmed && !self.simulate_gaze {
+            self.status_message =
+                "Enable live desktop mouse control in this workspace first.".into();
+            return;
+        }
+        self.input.set_dry_run(self.simulate_gaze);
         let pause = self.engine.safety != SafetyState::Paused;
         let events = self.engine.set_paused(pause);
         self.process_events(events);
@@ -345,7 +377,11 @@ impl EyeOsApp {
                     self.clear_overlay_target();
                 }
             }
-            Page::Calibration | Page::Training | Page::Setup | Page::Settings => {}
+            Page::Setup => {
+                let events = self.engine.update(sample);
+                self.process_events(events);
+            }
+            Page::Calibration | Page::Training => {}
         }
     }
 
@@ -772,11 +808,70 @@ impl EyeOsApp {
     }
 
     fn render_setup(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        self.render_full_header(ui, context, "Caregiver setup and calibration");
+        ui.heading("EyeOS tracking workspace");
+        ui.horizontal(|ui| {
+            let (rect, response) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
+            let colour = match self.engine.safety {
+                SafetyState::Tracking => Color32::LIGHT_GREEN,
+                SafetyState::TrackingLost => Color32::LIGHT_RED,
+                SafetyState::Paused => Color32::YELLOW,
+            };
+            ui.painter()
+                .circle_filled(rect.center(), 20.0, Color32::from_rgb(19, 31, 44));
+            ui.painter()
+                .circle_stroke(rect.center(), 20.0, Stroke::new(3.0_f32, colour));
+            ui.painter().circle_filled(rect.center(), 5.0, colour);
+            if response.clicked() {
+                self.toggle_tracking();
+            }
+            ui.label(if self.has_validated_calibration() {
+                "Precision validated"
+            } else {
+                "Calibration / validation needed"
+            });
+        });
         ui.group(|ui| {
             ui.label(RichText::new("Live tracker status").strong());
             ui.label(&self.status_message);
         });
+        if let Some(progress) = self
+            .tracker
+            .as_ref()
+            .and_then(|t| t.calibration_progress())
+            .filter(|p| p.target.is_some())
+        {
+            ui.separator();
+            ui.label(
+                RichText::new(format!(
+                    "{}: target {} of {}",
+                    progress.phase,
+                    progress.completed + 1,
+                    progress.total
+                ))
+                .strong(),
+            );
+            ui.label(&progress.instruction);
+            ui.add(
+                egui::ProgressBar::new(
+                    progress.stable_samples as f32 / CALIBRATION_SAMPLES_PER_TARGET as f32,
+                )
+                .text(format!(
+                    "{}/{} accepted samples",
+                    progress.stable_samples, CALIBRATION_SAMPLES_PER_TARGET
+                )),
+            );
+            ui.label(&progress.collection_status);
+            ui.label(
+                "Look at the highlighted circle. It moves after a stable fixation is collected.",
+            );
+            if ui.button("Cancel and return to setup").clicked() {
+                if let Some(tracker) = self.tracker.as_mut() {
+                    tracker.cancel_calibration();
+                }
+                self.set_page(Page::Setup, context);
+            }
+            return;
+        }
         ui.add_space(6.0);
         ui.label("Place the camera at eye height with even lighting. Calibration must be completed by the intended user.");
         match &self.camera {
@@ -830,12 +925,26 @@ impl EyeOsApp {
         } else {
             ui.label("A fresh calibration is required for the new tracking engine.");
         }
-        ui.label("Enter actual display dimensions and eye-to-screen distance in millimetres. Angular error is an estimate.");
+        ui.label(format!(
+            "Display: {:.0} × {:.0} pixels",
+            self.screen_size.x, self.screen_size.y
+        ));
+        if let Some(display) = &self.detected_display {
+            ui.label(format!(
+                "Display-reported size: {:.0} × {:.0} mm (editable)",
+                display.size_mm.x, display.size_mm.y
+            ));
+        } else {
+            ui.label(
+                "Display did not provide physical size; enter measured width and height below.",
+            );
+        }
+        ui.label("Enter eye-to-screen distance in mm. Angular error is estimated from these measurements.");
         let mut width = self.config.screen_width_mm.unwrap_or(0.0);
         let mut height = self.config.screen_height_mm.unwrap_or(0.0);
         let mut distance = self.config.viewing_distance_mm.unwrap_or(0.0);
-        let changed = ui
-            .horizontal(|ui| {
+        let mut changed = ui
+            .vertical(|ui| {
                 let a = ui
                     .add(
                         egui::DragValue::new(&mut width)
@@ -860,6 +969,16 @@ impl EyeOsApp {
                 a || b || c
             })
             .inner;
+        if ui.button("Read display size automatically").clicked() {
+            self.detected_display = primary_display_geometry();
+            if let Some(display) = &self.detected_display {
+                width = display.size_mm.x;
+                height = display.size_mm.y;
+                changed = true;
+            } else {
+                self.status_message = "This display does not expose usable physical dimensions; enter measured values.".into();
+            }
+        }
         if changed {
             self.config.screen_width_mm = (width > 0.0).then_some(width);
             self.config.screen_height_mm = (height > 0.0).then_some(height);
@@ -904,11 +1023,16 @@ impl EyeOsApp {
             .tracker
             .as_ref()
             .and_then(|t| t.calibration_progress())
-            .is_some_and(|p| p.target.is_none() && !p.suggested_targets.is_empty());
+            .is_some_and(|p| p.target.is_none() && !p.suggested_targets.is_empty())
+            || self.calibration.is_some();
         if ui
             .add_enabled(
                 ready && extra,
-                egui::Button::new("Add targeted calibration and revalidate"),
+                egui::Button::new(if self.calibration.is_some() {
+                    "Add targeted calibration and revalidate"
+                } else {
+                    "Resume remaining calibration"
+                }),
             )
             .clicked()
         {
@@ -923,6 +1047,44 @@ impl EyeOsApp {
                 Err(error) => self.status_message = error,
             }
         }
+        if !extra {
+            ui.label("Targeted calibration becomes available after initial calibration or an interrupted fixation.");
+        }
+        if self.has_validated_calibration() {
+            ui.separator();
+            if ui
+                .checkbox(
+                    &mut self.config.live_input_confirmed,
+                    "Enable live desktop mouse control",
+                )
+                .changed()
+            {
+                if !self.config.live_input_confirmed {
+                    self.input.set_dry_run(true);
+                    let events = self.engine.set_paused(true);
+                    self.process_events(events);
+                }
+                self.save_config();
+            }
+            if ui
+                .button(if self.engine.safety == SafetyState::Tracking {
+                    "Pause mouse control"
+                } else {
+                    "Start mouse control here"
+                })
+                .clicked()
+            {
+                if self.config.live_input_confirmed && self.engine.safety != SafetyState::Tracking {
+                    self.input.set_dry_run(false);
+                    let events = self.engine.set_paused(false);
+                    self.process_events(events);
+                } else {
+                    let events = self.engine.set_paused(true);
+                    self.process_events(events);
+                    self.input.set_dry_run(true);
+                }
+            }
+        }
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
         }
@@ -930,57 +1092,76 @@ impl EyeOsApp {
             self.set_page(Page::Overlay, context);
         }
         ui.separator();
-        if ui.button("Open accessibility settings").clicked() {
-            self.set_page(Page::Settings, context);
-        }
+        ui.collapsing("Accessibility and safety settings", |ui| {
+            self.render_settings(ui, context)
+        });
     }
 
-    fn render_calibration(&mut self, ui: &mut egui::Ui) {
+    fn render_workspace(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let rect = ui.max_rect();
-        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-        let Some(wizard) = self.tracker.as_ref().and_then(|t| t.calibration_progress()) else {
-            return;
-        };
-        let Some(target) = wizard.target else {
-            return;
-        };
-        let (completed, total) = (wizard.completed, wizard.total);
-        let target_position = Pos2::new(target.x as f32, target.y as f32);
-        let target_colour = if self.config.high_contrast {
-            Color32::WHITE
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(8, 16, 25));
+        let target = self
+            .tracker
+            .as_ref()
+            .and_then(|t| t.calibration_progress())
+            .and_then(|p| p.target);
+        if let Some(target) = target {
+            let p = physical_to_logical(target, context.pixels_per_point());
+            let p = Pos2::new(p.x as f32, p.y as f32);
+            ui.painter()
+                .circle_filled(p, 20.0, Color32::from_rgb(68, 230, 188));
+            ui.painter()
+                .circle_stroke(p, 32.0, Stroke::new(3.0_f32, Color32::WHITE));
+        }
+        if let Some(gaze) = self.gaze_preview {
+            let gaze = physical_to_logical(gaze, context.pixels_per_point());
+            ui.painter().circle_stroke(
+                Pos2::new(gaze.x as f32, gaze.y as f32),
+                10.0,
+                Stroke::new(2.0_f32, Color32::from_rgb(255, 190, 80)),
+            );
+        }
+        let width = 400.0_f32.min(rect.width() * 0.45);
+        // Controls stay opposite the target; center and edge targets remain visible.
+        let x = if target.is_some_and(|p| p.x < self.screen_size.x * 0.5) {
+            rect.right() - width - 12.0
         } else {
-            Color32::from_rgb(68, 230, 188)
+            rect.left() + 12.0
         };
-        ui.painter()
-            .circle_filled(target_position, 28.0, target_colour);
-        ui.painter()
-            .circle_stroke(target_position, 42.0, Stroke::new(4.0_f32, Color32::WHITE));
-        ui.painter().text(
-            Pos2::new(rect.center().x, 48.0),
-            Align2::CENTER_CENTER,
-            format!(
-                "{}: look at the target  •  {} of {}",
-                wizard.instruction,
-                completed + 1,
-                total
-            ),
-            FontId::proportional(26.0),
-            Color32::WHITE,
-        );
-        ui.painter().text(
-            Pos2::new(rect.center().x, 82.0),
-            Align2::CENTER_CENTER,
-            format!(
-                "Hold your gaze on the dot: {}/{} stable gaze-vector samples",
-                wizard.stable_samples, CALIBRATION_SAMPLES_PER_TARGET
-            ),
-            FontId::proportional(18.0),
-            Color32::from_gray(210),
-        );
+        egui::Area::new(egui::Id::new("tracking-workspace-controls"))
+            .fixed_pos(Pos2::new(x, rect.top() + 12.0))
+            .default_size(Vec2::new(width, rect.height() - 24.0))
+            .show(context, |ui| {
+                ui.set_min_height(rect.height() - 24.0);
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(22, 34, 46))
+                    .inner_margin(14.0)
+                    .corner_radius(12.0)
+                    .show(ui, |ui| {
+                        ui.set_width(width - 28.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(rect.height() - 52.0)
+                            .show(ui, |ui| {
+                                self.render_setup(ui, context);
+                                ui.separator();
+                                ui.label(if self.gaze_preview.is_some() {
+                                    "Amber ring: measured gaze preview"
+                                } else {
+                                    "Gaze preview appears after the screen mapping is calibrated."
+                                });
+                                if ui.button("Close EyeOS").clicked() {
+                                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            });
+                    });
+            });
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        self.render_full_header(ui, context, "Accessibility and safety settings");
+        if self.page != Page::Setup {
+            self.render_full_header(ui, context, "Accessibility and safety settings");
+        }
         ui.add(egui::Slider::new(&mut self.config.overlay_opacity, 0.2..=1.0).text("Blob opacity"));
         ui.add(egui::Slider::new(&mut self.engine.dwell_ms, 250..=3_000).text("Click dwell (ms)"));
         ui.add(
@@ -1100,6 +1281,7 @@ impl EyeOsApp {
                 }
             }
             if let Some(estimate) = event.estimate {
+                self.gaze_preview = estimate.filtered;
                 if estimate.state == TrackingState::Tracking && estimate.precision_validated {
                     if let Some(position) = estimate.filtered {
                         self.process_gaze_sample(
@@ -1127,6 +1309,7 @@ impl EyeOsApp {
         if self.latest_features.is_some_and(|(_, t)| {
             (self.started_at.elapsed().as_millis() as u64).saturating_sub(t) > 200
         }) {
+            self.gaze_preview = None;
             self.clear_overlay_target();
             if self.engine.safety != SafetyState::Paused {
                 let events = self.engine.update(GazeSample {
@@ -1173,19 +1356,13 @@ impl eframe::App for EyeOsApp {
                         self.render_keyboard_overlay(ui, context);
                     });
             }
-            Page::Calibration => {
+            Page::Calibration | Page::Setup => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(context, |ui| self.render_calibration(ui));
+                    .show(context, |ui| self.render_workspace(ui, context));
             }
             Page::Training => {
                 egui::CentralPanel::default().show(context, |ui| self.render_training(ui, context));
-            }
-            Page::Setup => {
-                egui::CentralPanel::default().show(context, |ui| self.render_setup(ui, context));
-            }
-            Page::Settings => {
-                egui::CentralPanel::default().show(context, |ui| self.render_settings(ui, context));
             }
         }
 
@@ -1312,6 +1489,16 @@ fn tracking_config(screen_size: Point, config: &AppConfig) -> TrackerConfig {
     }
 }
 
+// Window sizes are logical units. Query primary-display scaling before the
+// first egui input frame; context.pixels_per_point() is not initialized yet.
+fn primary_ui_size() -> Point {
+    #[cfg(windows)]
+    let scale = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForSystem() }.max(96) as f32 / 96.0;
+    #[cfg(not(windows))]
+    let scale = 1.0;
+    physical_to_logical(primary_screen_size(), scale)
+}
+
 fn physical_cursor_position() -> Option<Point> {
     #[cfg(windows)]
     {
@@ -1325,6 +1512,13 @@ fn physical_cursor_position() -> Option<Point> {
 }
 
 fn run() -> Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let cli = Cli::parse();
     let store = ProfileStore::for_current_user()?;
     if cli.reset_profile {
@@ -1344,14 +1538,16 @@ fn run() -> Result<()> {
     let config = store.load_config()?;
     let page = if cli.training {
         Page::Training
-    } else if cli.setup {
-        Page::Setup
     } else {
-        Page::Overlay
+        Page::Setup
     };
     let (size, position) = match page {
         Page::Overlay => (Vec2::splat(BLOB_SIZE), [OVERLAY_MARGIN, 900.0]),
-        Page::Training | Page::Setup | Page::Settings => (Vec2::new(620.0, 620.0), [80.0, 80.0]),
+        Page::Training => (Vec2::new(620.0, 620.0), [80.0, 80.0]),
+        Page::Setup => {
+            let size = primary_ui_size();
+            (Vec2::new(size.x as f32, size.y as f32), [0.0, 0.0])
+        }
         Page::Actions => (Vec2::splat(PANEL_SIZE), [OVERLAY_MARGIN, 700.0]),
         Page::Keyboard => (
             Vec2::new(KEYBOARD_WIDTH, KEYBOARD_HEIGHT),
@@ -1364,10 +1560,15 @@ fn run() -> Result<()> {
             .with_title("EyeOS")
             .with_inner_size(size)
             .with_position(position)
-            .with_transparent(true)
+            .with_transparent(matches!(
+                page,
+                Page::Overlay | Page::Actions | Page::Keyboard
+            ))
+            .with_fullscreen(false)
             .with_decorations(false)
             .with_resizable(false)
             .with_always_on_top(),
+        persist_window: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -1375,7 +1576,7 @@ fn run() -> Result<()> {
         options,
         Box::new(move |context| {
             let mut app = EyeOsApp::new(store, config, page, cli.simulate_gaze);
-            app.set_page(page, &context.egui_ctx);
+            app.set_page(app.page, &context.egui_ctx);
             Ok(Box::new(app))
         }),
     )

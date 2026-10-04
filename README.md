@@ -8,7 +8,12 @@ predictions remain on the device.
 
 ## Launch behaviour
 
-Running `eyeos.exe` opens only a small transparent control blob in the bottom-left corner.
+Running `eyeos.exe` opens the fullscreen tracking workspace.
+Setup, calibration targets, accepted-sample progress, live status, gaze preview,
+and a clickable control blob share this screen. Monitor EDID supplies physical
+display size when available; viewing distance is entered by the user. After
+calibration, the optional floating desktop mode opens a small transparent control
+blob in the bottom-left corner.
 There is no startup dashboard or menu. With a valid local tracker and independently validated calibration, it
 starts tracking immediately. An 800 ms dwell on the blob opens the compact 3×3 action pad;
 choosing an action returns to the blob. The gaze keyboard is also a compact bottom overlay and
@@ -45,7 +50,7 @@ freshness, image quality, and independent precision validation determine usabili
 ## Commands
 
 ```text
-eyeos.exe                  Start the floating control blob.
+eyeos.exe                  Open the combined tracking workspace.
 eyeos.exe --training       Open the safe training environment.
 eyeos.exe --setup          Open caregiver calibration/setup.
 eyeos.exe --install-autostart

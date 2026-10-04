@@ -269,6 +269,55 @@ fn frame_validation_checks_padding_and_overflow() {
 }
 
 #[test]
+fn short_blinks_do_not_trap_calibration_on_the_first_target() {
+    let mut session = CalibrationSession::new(config()).unwrap();
+    let first = session.target().unwrap();
+    for i in 0..50 {
+        let now = i * 66;
+        let mut sample = observation(0.08, 0.08, now);
+        if i % 5 == 0 {
+            sample.blink = true;
+        }
+        assert!(session.observe(sample, now).is_none());
+        if session.target() != Some(first) {
+            break;
+        }
+    }
+    assert_ne!(session.target(), Some(first));
+    assert_eq!(session.progress().0, 1);
+}
+
+#[test]
+fn loss_or_too_few_frames_times_out_and_remaining_targets_can_resume() {
+    let mut session = CalibrationSession::new(config()).unwrap();
+    let target = session.target();
+    session.observe(observation(0.08, 0.08, 0), 0);
+    session.observe(observation(0.08, 0.08, 700), 700);
+    assert_eq!(session.sample_progress(), 1);
+    session.observe(Observation::default(), 1100);
+    assert_eq!(session.sample_progress(), 0);
+    let outcome = session.observe(observation(0.08, 0.08, 9000), 9000);
+    assert!(matches!(outcome, Some(CalibrationOutcome::Rejected(_))));
+    assert!(!session.suggested_targets().is_empty());
+    session.extend().unwrap();
+    assert_eq!(session.target(), target);
+    assert_eq!(session.progress(), (0, 12));
+}
+
+#[test]
+fn saved_profiles_can_request_fresh_targeted_calibration() {
+    let p = profile();
+    let mut session = CalibrationSession::from_profile(p.clone()).unwrap();
+    assert!(session.target().is_none());
+    assert!(!session.suggested_targets().is_empty());
+    session.extend().unwrap();
+    assert!(session.target().is_some());
+    // A previous mapping is retained as labeled fixations, never as predicted labels.
+    assert!(session.progress().1 <= 5);
+    assert!(session.report().is_none());
+}
+
+#[test]
 fn stationary_gaze_and_invalid_labels_cannot_make_a_profile() {
     let mut s = fixations(&config());
     for f in &mut s {

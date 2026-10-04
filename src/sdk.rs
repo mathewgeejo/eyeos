@@ -95,6 +95,7 @@ pub struct CalibrationProgress {
     pub completed: usize,
     pub total: usize,
     pub stable_samples: usize,
+    pub collection_status: String,
     pub suggested_targets: Vec<Point>,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +247,14 @@ impl EyeTracker {
         Ok(())
     }
     pub fn extend_calibration(&mut self) -> Result<(), String> {
+        if self.session.is_none() {
+            let profile = self
+                .engine
+                .profile()
+                .cloned()
+                .ok_or("complete initial calibration before adding targeted samples")?;
+            self.session = Some(CalibrationSession::from_profile(profile)?);
+        }
         self.session
             .as_mut()
             .ok_or("no calibration session")?
@@ -267,6 +276,7 @@ impl EyeTracker {
                 completed,
                 total,
                 stable_samples: session.sample_progress(),
+                collection_status: session.collection_status().into(),
                 suggested_targets: session.suggested_targets(),
             }
         })

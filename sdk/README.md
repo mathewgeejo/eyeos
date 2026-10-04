@@ -132,6 +132,14 @@ control. This is a contrast/exposure heuristic, not a probability of correct gaz
 Accepted observations must still pass blink, crop, pose, freshness, and independent
 precision validation checks. Hosts can set a stricter `minimum_quality`.
 
+`CalibrationProgress.collection_status` explains settling, accepted samples,
+noisy fixation, poor images, and interruptions. Short blinks skip samples; long
+losses reset the bounded fixation window. If a fixation times out, extending the
+session resumes the remaining initial targets. Extending a completed or imported
+profile collects new weak-region labels and performs fresh independent validation.
+EyeOS combines these controls, targets, and the gaze preview in one DPI-aware
+fullscreen workspace and reads the primary monitor's EDID size when available.
+
 If setup reports backward-facing gaze on an ordinary front-facing user, check
 that the running executable/DLL is updated. XNNPACK initialization and feedback
 tensor warnings are native runtime diagnostics; they do not indicate a gaze

@@ -31,6 +31,7 @@ export interface AccuracyReport {
 export interface CalibrationProgress {
   target: Point | null; phase: string; instruction: string;
   completed: number; total: number; stable_samples: number; suggested_targets: Point[];
+  collection_status: string;
 }
 export interface Profile {
   version: number; config: TrackerConfig; validation_passed: boolean;

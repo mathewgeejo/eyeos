@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 pub const CALIBRATION_SAMPLES_PER_TARGET: usize = 12;
 const SETTLE_MS: u64 = 650;
 const WINDOW_MS: u64 = 350;
+const MAX_WINDOW_MS: u64 = 1500;
+const MAX_GAP_MS: u64 = 300;
+const TARGET_TIMEOUT_MS: u64 = 8000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabeledObservation {
@@ -44,6 +47,7 @@ pub struct CalibrationSession {
     failed_targets: Vec<Point>,
     report: Option<AccuracyReport>,
     extended: bool,
+    collection_status: &'static str,
 }
 impl CalibrationSession {
     pub fn new(config: TrackerConfig) -> Result<Self, String> {
@@ -89,6 +93,7 @@ impl CalibrationSession {
             failed_targets: vec![],
             report: None,
             extended: false,
+            collection_status: "Look at the dot; waiting for eye samples",
         })
     }
     pub fn target(&self) -> Option<Point> {
@@ -111,6 +116,19 @@ impl CalibrationSession {
     pub fn sample_progress(&self) -> usize {
         self.feature_samples.len()
     }
+    pub fn collection_status(&self) -> &'static str {
+        self.collection_status
+    }
+    /// Continue a saved profile with newly labeled weak-region fixations.
+    pub fn from_profile(profile: CalibrationProfile) -> Result<Self, String> {
+        profile.validate(&profile.config)?;
+        let mut session = Self::new(profile.config.clone())?;
+        session.fixations = profile.fixations.clone();
+        session.report = profile.accuracy.clone();
+        session.candidate = Some(profile);
+        session.phase = Phase::Complete;
+        Ok(session)
+    }
     pub fn phase_label(&self) -> &'static str {
         match self.phase {
             Phase::Mapping => "Calibration",
@@ -120,7 +138,7 @@ impl CalibrationSession {
     }
     pub fn instruction(&self) -> &'static str {
         if self.phase == Phase::Mapping && !self.extended {
-            match self.current {
+            match self.fixations.len() {
                 9 => "Keep looking at the dot; turn your head slightly left",
                 10 => "Keep looking at the dot; turn your head slightly right",
                 11 => "Keep looking at the dot; move slightly closer",
@@ -134,6 +152,15 @@ impl CalibrationSession {
         self.report.as_ref()
     }
     pub fn suggested_targets(&self) -> Vec<Point> {
+        if self.phase == Phase::Complete && self.candidate.is_none() {
+            return self
+                .targets
+                .iter()
+                .skip(self.current)
+                .take(5)
+                .copied()
+                .collect();
+        }
         let mut targets = self.failed_targets.clone();
         if let Some(profile) = &self.candidate {
             let mut errors: Vec<_> = self
@@ -154,6 +181,32 @@ impl CalibrationSession {
                     break;
                 }
             }
+            if targets.is_empty() {
+                // Saved profiles retain region errors, not validation frames.
+                // Select new targets in weak regions without reusing their labels.
+                let mut regions = profile
+                    .accuracy
+                    .as_ref()
+                    .map(|r| r.regions.clone())
+                    .unwrap_or_default();
+                regions.sort_by(|a, b| b.p95_px.total_cmp(&a.p95_px));
+                for region in regions.iter().take(5) {
+                    if let Some(target) = self.validation_targets.iter().find(|p| {
+                        let x = (p.x / self.config.screen_size.x * 3.0)
+                            .floor()
+                            .clamp(0.0, 2.0) as u32;
+                        let y = (p.y / self.config.screen_size.y * 3.0)
+                            .floor()
+                            .clamp(0.0, 2.0) as u32;
+                        region.region == format!("row{}-col{}", y + 1, x + 1)
+                    }) {
+                        targets.push(*target);
+                    }
+                }
+            }
+            if targets.is_empty() {
+                targets.extend(self.validation_targets.iter().take(5).copied());
+            }
         }
         targets.truncate(5);
         targets
@@ -165,14 +218,20 @@ impl CalibrationSession {
         if self.fixations.len() >= 128 {
             return Err("calibration is too large; start a fresh session".into());
         }
-        let targets = self.suggested_targets();
+        let resuming_initial = self.candidate.is_none();
+        let targets = if resuming_initial {
+            self.targets.iter().skip(self.current).copied().collect()
+        } else {
+            self.suggested_targets()
+        };
         if targets.is_empty() {
             return Err("no extra targets available".into());
         }
         self.targets = targets;
         self.current = 0;
         self.phase = Phase::Mapping;
-        self.extended = true;
+        // Retain the center/head-movement instructions when resuming initial setup.
+        self.extended = !resuming_initial;
         self.target_started = None;
         self.feature_samples.clear();
         self.validation.clear();
@@ -180,6 +239,7 @@ impl CalibrationSession {
         self.failed_targets.clear();
         self.report = None;
         self.candidate = None;
+        self.collection_status = "Look at the dot; collecting fresh labeled samples";
         Ok(())
     }
     pub fn observe(
@@ -196,14 +256,25 @@ impl CalibrationSession {
         let started = *self.target_started.get_or_insert(timestamp_ms);
         let elapsed = timestamp_ms.saturating_sub(started);
         if elapsed < SETTLE_MS {
+            self.collection_status = "Let your eyes settle on the new target";
             return None;
         }
         if self.phase == Phase::Validation {
             self.attempted += 1;
         }
         if !observation.usable(self.config.minimum_quality) {
-            self.feature_samples.clear();
-            if elapsed >= 4000 {
+            self.collection_status =
+                "Blink, missing eyes, or poor image quality; waiting for a clear sample";
+            // Skip a short blink; it must not erase every accepted frame.
+            // Long losses still discard the window to avoid mixing fixations.
+            if self
+                .feature_samples
+                .last()
+                .is_some_and(|s| timestamp_ms.saturating_sub(s.timestamp_ms) > MAX_GAP_MS)
+            {
+                self.feature_samples.clear();
+            }
+            if elapsed >= TARGET_TIMEOUT_MS {
                 return self.timeout(target, timestamp_ms);
             }
             return None;
@@ -211,16 +282,30 @@ impl CalibrationSession {
         if self.phase == Phase::Validation
             && self.candidate.as_ref()?.predict(observation).is_none()
         {
-            if elapsed >= 4000 {
+            self.collection_status = "This pose is outside calibration coverage";
+            if elapsed >= TARGET_TIMEOUT_MS {
                 return self.timeout(target, timestamp_ms);
             }
             return None;
         }
+        if self
+            .feature_samples
+            .last()
+            .is_some_and(|s| timestamp_ms.saturating_sub(s.timestamp_ms) > MAX_GAP_MS)
+        {
+            self.feature_samples.clear();
+        }
+        self.feature_samples
+            .retain(|s| timestamp_ms.saturating_sub(s.timestamp_ms) <= MAX_WINDOW_MS);
         self.feature_samples.push(observation);
+        self.collection_status = "Collecting stable eye samples";
         let first = self.feature_samples.first()?.timestamp_ms;
         if self.feature_samples.len() < CALIBRATION_SAMPLES_PER_TARGET
             || timestamp_ms - first < WINDOW_MS
         {
+            if elapsed >= TARGET_TIMEOUT_MS {
+                return self.timeout(target, timestamp_ms);
+            }
             return None;
         }
         let x = quantile(
@@ -237,8 +322,10 @@ impl CalibrationSession {
             .map(|s| (s.x - x).hypot(s.y - y))
             .collect();
         if quantile(&spreads, 0.8) > 0.025 {
-            self.feature_samples.clear();
-            if elapsed >= 4000 {
+            self.collection_status = "Gaze is moving or noisy; keep looking at the dot";
+            // Slide the window instead of restarting all twelve samples.
+            self.feature_samples.remove(0);
+            if elapsed >= TARGET_TIMEOUT_MS {
                 return self.timeout(target, timestamp_ms);
             }
             return None;
@@ -274,6 +361,13 @@ impl CalibrationSession {
                     0.5,
                 );
             }
+            let norm = aggregate
+                .gaze_direction
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            aggregate.gaze_direction.iter_mut().for_each(|v| *v /= norm);
             aggregate.face_center = Point::new(med(|s| s.face_center.x), med(|s| s.face_center.y));
             aggregate.face_scale = med(|s| s.face_scale);
             let iris = |left| {
@@ -310,6 +404,7 @@ impl CalibrationSession {
     fn timeout(&mut self, target: Point, timestamp_ms: u64) -> Option<CalibrationOutcome> {
         if self.phase == Phase::Mapping {
             self.phase = Phase::Complete;
+            self.collection_status = "Fixation incomplete; use Resume remaining calibration";
             Some(CalibrationOutcome::Rejected(
                 "Could not collect a stable fixation. Improve lighting/camera position and retry."
                     .into(),
@@ -321,6 +416,7 @@ impl CalibrationSession {
     }
     fn advance(&mut self, timestamp_ms: u64) -> Option<CalibrationOutcome> {
         self.current += 1;
+        self.collection_status = "Target collected; let your eyes settle on the next dot";
         self.feature_samples.clear();
         self.target_started = Some(timestamp_ms);
         if self.phase == Phase::Mapping && self.current == self.targets.len() {

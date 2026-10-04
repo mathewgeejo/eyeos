@@ -5,6 +5,8 @@ pub mod calibration;
 #[cfg(all(windows, feature = "camera"))]
 mod capture;
 pub mod config;
+#[cfg(feature = "desktop")]
+pub mod display;
 pub mod ffi;
 pub mod gaze;
 #[cfg(all(windows, feature = "native"))]

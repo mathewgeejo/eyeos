@@ -43,6 +43,13 @@ fn capture_loop(
     clock: Instant,
 ) -> Result<()> {
     let mut camera = Camera::new(index, format).map_err(|e| anyhow!("opening webcam: {e}"))?;
+    // nokhwa's MSMF refresh reads the low half of MF_MT_FRAME_RATE (the
+    // denominator, commonly 1) as FPS. Preserve the negotiated mode's rate
+    // for diagnostics instead; actual throughput is measured below.
+    let negotiated = camera
+        .compatible_camera_formats()
+        .ok()
+        .and_then(|formats| format.fulfill(&formats));
     camera
         .open_stream()
         .map_err(|e| anyhow!("opening camera stream: {e}"))?;
@@ -50,7 +57,10 @@ fn capture_loop(
     let _ = events.send(TrackerEvent::Status(TrackerStatus::CameraReady {
         width: size.width_x,
         height: size.height_y,
-        fps: camera.frame_rate(),
+        fps: negotiated
+            .filter(|mode| mode.resolution() == size && mode.format() == camera.frame_format())
+            .map(|mode| mode.frame_rate())
+            .unwrap_or_else(|| camera.frame_rate()),
         format: camera.frame_format().to_string(),
         device_id: format!("{:?}", camera.info()),
     }));

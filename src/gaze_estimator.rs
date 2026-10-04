@@ -11,7 +11,7 @@ use openvino::{CompiledModel, Core, DeviceType, ElementType, InferRequest, Shape
 use sha2::{Digest, Sha256};
 
 use crate::vision::{EyeFeatures, LANDMARK_COUNT, Landmark, LandmarkFrame};
-use eye_tracker_core::{Point, Quality, normalize_gaze_vector};
+use eye_tracker_core::{MINIMUM_IMAGE_QUALITY, Point, Quality, normalize_gaze_vector};
 
 const IMAGE_SIDE: usize = 60;
 const IMAGE_VALUES: usize = 3 * IMAGE_SIDE * IMAGE_SIDE;
@@ -258,7 +258,7 @@ impl GazeEstimator {
         }
         let image_score = eye_image_quality(rgb, width, height, left)?
             .min(eye_image_quality(rgb, width, height, right)?);
-        if image_score < 0.35 {
+        if image_score < MINIMUM_IMAGE_QUALITY {
             bail!("eye crops are too dark, overexposed, or lack contrast")
         }
 
@@ -321,8 +321,9 @@ impl GazeEstimator {
         // This is an image/geometry quality score, never a vector-norm probability.
         let confidence = image_score.min(landmark_confidence.unwrap_or(1.0));
         Ok(EyeFeatures {
-            x: direction[0] / direction[2],
-            y: direction[1] / direction[2],
+            // Project using positive depth while retaining the native vector.
+            x: direction[0] / -direction[2],
+            y: direction[1] / -direction[2],
             gaze_direction: direction,
             head_pose: angles.map(f64::from),
             left_iris: Some(left_iris),
@@ -787,18 +788,12 @@ mod tests {
                 [value, value, value]
             })
             .collect();
-        match estimator.estimate(&rgb, 640, 480, &frame) {
-            Ok(feature) => {
-                assert!(feature.x.is_finite() && feature.y.is_finite());
-                assert!(feature.confidence > 0.0);
-            }
-            // A checkerboard is not an eye. Both models have executed, but the
-            // generated direction must still pass the same physical validity gate.
-            Err(error) => assert_eq!(
-                error.to_string(),
-                "invalid or backward-facing gaze direction"
-            ),
-        }
+        // The pinned network returns negative Z. A reversed sign gate used to
+        // reject this output and every real front-facing user's gaze as well.
+        let feature = estimator.estimate(&rgb, 640, 480, &frame).unwrap();
+        assert!(feature.x.is_finite() && feature.y.is_finite());
+        assert!(feature.gaze_direction[2] < -0.05);
+        assert!(feature.usable(0.72));
     }
 
     #[test]

@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub const PROFILE_VERSION: u32 = 2;
 pub const FEATURE_COUNT: usize = 16;
-pub const MODEL_ID: &str = "mediapipe-64184e229b26/adas-0002/preprocess-v2";
+pub const MODEL_ID: &str = "mediapipe-64184e229b26/adas-0002/preprocess-v3";
+/// Hard image-quality floor shared by inference, calibration, and desktop control.
+/// This heuristic measures crop contrast/exposure; it is not model confidence.
+pub const MINIMUM_IMAGE_QUALITY: f32 = 0.35;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct Point {
@@ -51,6 +54,7 @@ impl Default for Quality {
 pub struct Observation {
     pub x: f64,
     pub y: f64,
+    /// Unit ADAS-0002 vector: X right, Y up, negative Z toward the screen.
     pub gaze_direction: [f64; 3],
     /// Yaw, pitch, roll in degrees, before crop alignment.
     pub head_pose: [f64; 3],
@@ -102,7 +106,7 @@ impl Observation {
         self.features().iter().all(|v| v.is_finite())
             && self.gaze_direction.iter().all(|v| v.is_finite())
             && (0.95..=1.05).contains(&norm)
-            && self.gaze_direction[2] >= 0.05
+            && self.gaze_direction[2] <= -0.05
             && self.confidence.is_finite()
             && self.confidence >= minimum
             && self.confidence <= 1.0
@@ -110,7 +114,7 @@ impl Observation {
             && !self.one_eye_fallback
             && self.quality.crops_valid
             && self.quality.image_score.is_finite()
-            && self.quality.image_score >= 0.35
+            && self.quality.image_score >= MINIMUM_IMAGE_QUALITY
             && self
                 .quality
                 .eye_opening
@@ -191,7 +195,7 @@ impl Default for TrackerConfig {
             camera_id: "webcam:0".into(),
             display_id: "primary".into(),
             model_id: MODEL_ID.into(),
-            minimum_quality: 0.72,
+            minimum_quality: MINIMUM_IMAGE_QUALITY,
             maximum_frame_age_ms: 200,
             median_target_deg: 1.0,
             p95_target_deg: 2.0,

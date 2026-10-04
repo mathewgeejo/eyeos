@@ -1,5 +1,7 @@
-/// Open Model Zoo outputs a non-unit direction. Normalize, restore camera roll,
-/// and preserve the sign of Z: directions facing away must not become valid gaze.
+/// Normalize ADAS-0002 output and restore camera roll exactly once.
+/// Intel's reference gazeVectorToGazeAngles maps (0, 0, -1) to straight ahead.
+/// Preserve that native convention: screen-facing gaze has negative Z. Never
+/// use abs(Z), which would also admit a genuinely reversed direction.
 pub fn normalize_gaze_vector(vector: [f32; 3], roll_degrees: f32) -> Option<[f64; 3]> {
     if !roll_degrees.is_finite() || vector.iter().any(|v| !v.is_finite()) {
         return None;
@@ -15,5 +17,5 @@ pub fn normalize_gaze_vector(vector: [f32; 3], roll_degrees: f32) -> Option<[f64
         (-v[0] * roll.sin() + v[1] * roll.cos()) / magnitude,
         v[2] / magnitude,
     ];
-    (direction[2] >= 0.05).then_some(direction)
+    (direction[2] <= -0.05).then_some(direction)
 }

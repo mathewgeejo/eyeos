@@ -280,7 +280,7 @@ mod tests {
                     observation: eye_tracker_core::Observation {
                         x,
                         y,
-                        gaze_direction: [0.0, 0.0, 1.0],
+                        gaze_direction: [0.0, 0.0, -1.0],
                         confidence: 1.0,
                         ..eye_tracker_core::Observation::default()
                     },

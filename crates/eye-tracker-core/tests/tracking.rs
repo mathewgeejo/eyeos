@@ -13,7 +13,7 @@ fn observation(x: f64, y: f64, timestamp_ms: u64) -> Observation {
     Observation {
         x,
         y,
-        gaze_direction: [x / norm, y / norm, 1.0 / norm],
+        gaze_direction: [x / norm, y / norm, -1.0 / norm],
         confidence: 1.0,
         timestamp_ms,
         inference_latency_ms: 12.0,
@@ -40,14 +40,56 @@ fn profile() -> CalibrationProfile {
 
 #[test]
 fn vector_scale_is_not_confidence_and_roll_is_restored_once() {
-    let a = normalize_gaze_vector([0.1, 0.2, 1.0], 0.0).unwrap();
-    let b = normalize_gaze_vector([0.9, 1.8, 9.0], 0.0).unwrap();
+    let a = normalize_gaze_vector([0.1, 0.2, -1.0], 0.0).unwrap();
+    let b = normalize_gaze_vector([0.9, 1.8, -9.0], 0.0).unwrap();
     assert!(a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-7));
-    let rotated = normalize_gaze_vector([1.0, 0.0, 1.0], 90.0).unwrap();
-    assert!(rotated[0].abs() < 1e-8 && rotated[1] < 0.0 && rotated[2] > 0.0);
+    let rotated = normalize_gaze_vector([1.0, 0.0, -1.0], 90.0).unwrap();
+    assert!(rotated[0].abs() < 1e-8 && rotated[1] < 0.0 && rotated[2] < 0.0);
     assert!(normalize_gaze_vector([0.0; 3], 0.0).is_none());
-    assert!(normalize_gaze_vector([0.0, 0.0, -1.0], 0.0).is_none());
+    assert!(normalize_gaze_vector([0.0, 0.0, 1.0], 0.0).is_none());
+    assert!(normalize_gaze_vector([1.0, 0.0, -0.001], 0.0).is_none());
     assert!(normalize_gaze_vector([f32::NAN, 0.0, 1.0], 0.0).is_none());
+}
+
+#[test]
+fn native_forward_gaze_survives_normalization_and_engine_quality_checks() {
+    // Intel's reference computes horizontal degrees as 90 + atan2(z, x).
+    // Therefore (0, 0, -1), not positive Z, is a straight-ahead gaze.
+    let direction = normalize_gaze_vector([0.0, 0.0, -0.9], 0.0).unwrap();
+    assert_eq!(direction, [0.0, 0.0, -1.0]);
+    let mut sample = observation(0.0, 0.0, 100);
+    sample.gaze_direction = direction;
+    assert!(sample.usable(0.72));
+    let mut tracker = EyeTracker::new(config()).unwrap();
+    assert_eq!(
+        tracker.process(sample, 100).state,
+        TrackingState::Uncalibrated
+    );
+    sample.timestamp_ms = 133;
+    sample.gaze_direction[2] = 1.0;
+    assert_eq!(
+        tracker.process(sample, 133).state,
+        TrackingState::TrackingLost
+    );
+}
+
+#[test]
+fn image_quality_uses_one_floor_without_claiming_validated_precision() {
+    let c = config();
+    let mut tracker = EyeTracker::new(c.clone()).unwrap();
+    let mut sample = observation(0.5, 0.5, 100);
+    sample.quality.image_score = 0.5;
+    sample.confidence = 0.5;
+    assert!(sample.usable(c.minimum_quality));
+    let estimate = tracker.process(sample, 100);
+    assert_eq!(estimate.state, TrackingState::Uncalibrated);
+    assert!(!estimate.precision_validated);
+    sample.timestamp_ms = 133;
+    sample.quality.image_score = MINIMUM_IMAGE_QUALITY - 0.01;
+    assert_eq!(
+        tracker.process(sample, 133).state,
+        TrackingState::TrackingLost
+    );
 }
 
 #[test]
@@ -170,6 +212,9 @@ fn profiles_reject_old_versions_wrong_devices_and_malformed_models() {
     assert!(tracker.set_profile(p).is_err());
     let mut p = profile();
     p.config.camera_id = "another camera".into();
+    assert!(tracker.set_profile(p).is_err());
+    let mut p = profile();
+    p.config.model_id = "mediapipe-64184e229b26/adas-0002/preprocess-v2".into();
     assert!(tracker.set_profile(p).is_err());
     let mut p = profile();
     p.regression.coefficients.clear();

@@ -121,6 +121,22 @@ and resolution; RGB profiles bind frame resolution. Old EyeOS maps need fresh ca
 SDK JSON export is plaintext for host-managed storage; EyeOS wraps the same profile
 in Windows DPAPI. Raw frames are neither exported nor retained in profiles.
 
+The ADAS adapter preserves Intel's reference vector convention: X right, Y up,
+and **negative Z for forward gaze**. Observation `x` and `y` are X/(-Z) and Y/(-Z);
+the learned mapping converts these features to screen coordinates. The v3
+preprocessing identifier invalidates older profiles that used the reversed Z gate.
+Recalibrate after updating both EyeOS and the SDK DLL.
+
+The default quality floor is 0.35 across inference, calibration, and desktop
+control. This is a contrast/exposure heuristic, not a probability of correct gaze.
+Accepted observations must still pass blink, crop, pose, freshness, and independent
+precision validation checks. Hosts can set a stricter `minimum_quality`.
+
+If setup reports backward-facing gaze on an ordinary front-facing user, check
+that the running executable/DLL is updated. XNNPACK initialization and feedback
+tensor warnings are native runtime diagnostics; they do not indicate a gaze
+calibration result. Accuracy still requires the separate on-screen validation.
+
 ## Tests and real accuracy evaluation
 
 ```powershell
@@ -137,6 +153,13 @@ session. Include rejected observations in the dataset to measure coverage honest
 Collect consented sessions with glasses, different lighting, edges and head movement;
 do not treat synthetic tests or model initialization as proof of webcam accuracy.
 No real-user accuracy dataset ships with this repository.
+
+For interactive webcam use, build the optimized app/SDK with
+`cargo build --release --bin eyeos --lib`, then use `target/release/eyeos.exe`
+or `target/release/eyeos.dll`. Debug builds are intended for development and
+can reduce frame throughput. Processing below 25 FPS is advisory: calibration
+continues with fresh valid frames, and precision still depends on independent
+validation. Stale frames and actual tracking loss still clear gaze output.
 
 Camera shutdown signals its worker promptly. A Windows camera driver may block
 inside a frame-read call; the SDK does not hang the host waiting for that call.

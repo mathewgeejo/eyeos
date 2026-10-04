@@ -65,7 +65,7 @@ impl ControlEngine {
             keyboard_dwell_ms: 500,
             fixation_ms: 120,
             cooldown_ms: 250,
-            minimum_confidence: 0.72,
+            minimum_confidence: eye_tracker_core::MINIMUM_IMAGE_QUALITY,
             screen_size: Point::new(screen_width, screen_height),
             smoothed: None,
             fixation_point: None,

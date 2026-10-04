@@ -1261,7 +1261,7 @@ fn tracker_status_message(status: TrackerStatus) -> String {
         }
         TrackerStatus::Tracking { fps } => format!("Eye tracker active ({fps:.0} FPS)."),
         TrackerStatus::LowFrameRate { fps } => {
-            format!("Tracking paused: webcam inference is too slow ({fps:.0} FPS).")
+            format!("Webcam processing at {fps:.0} FPS; calibration may take longer.")
         }
         TrackerStatus::GazeUnavailable { detail } => {
             format!("Tracking paused: gaze estimate is not reliable ({detail}).")

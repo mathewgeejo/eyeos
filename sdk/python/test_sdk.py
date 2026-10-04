@@ -12,7 +12,7 @@ class NativeSdkTests(unittest.TestCase):
         with Tracker() as tracker:
             tracker.import_profile(profile)
             event = tracker.process_observation({"x": 0.25, "y": 0.75, "confidence": 1,
-                "gaze_direction": [0, 0, 1], "timestamp_ms": tracker.timestamp_ms()})
+                "gaze_direction": [0, 0, -1], "timestamp_ms": tracker.timestamp_ms()})
             self.assertEqual(event["estimate"]["raw"], {"x": 480.0, "y": 810.0})
             self.assertEqual(event["estimate"]["filtered"], event["estimate"]["raw"])
             self.assertFalse(event["estimate"]["precision_validated"])
@@ -26,7 +26,7 @@ class NativeSdkTests(unittest.TestCase):
             with self.assertRaises(TrackerError):
                 tracker.import_profile({"version": 1})
             event = tracker.process_observation({"x": 0.5, "y": 0.5, "confidence": 1,
-                                                 "gaze_direction": [0, 0, 1],
+                                                 "gaze_direction": [0, 0, -1],
                                                  "timestamp_ms": tracker.timestamp_ms()})
             self.assertEqual(event["estimate"]["state"], "Uncalibrated")
             self.assertFalse(event["estimate"]["precision_validated"])

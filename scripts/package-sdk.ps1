@@ -32,7 +32,7 @@ $manifest = @{
     abi_version = 1
     platform = 'windows-x86_64'
     build_flavor = $BuildFlavor
-    model_id = 'mediapipe-64184e229b26/adas-0002/preprocess-v2'
+    model_id = 'mediapipe-64184e229b26/adas-0002/preprocess-v3'
     native_sha256 = (Get-FileHash -LiteralPath (Join-Path $sdkPackagePath 'native\eyeos.dll') -Algorithm SHA256).Hash.ToLowerInvariant()
     accuracy = 'Measured per user; no universal precision guarantee'
 }

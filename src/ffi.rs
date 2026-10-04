@@ -420,7 +420,7 @@ mod tests {
             unsafe { et_import_profile(handle, profile.as_ptr(), profile.len()) },
             ET_OK
         );
-        let observation = serde_json::json!({"x":0.25,"y":0.75,"gaze_direction":[0.0,0.0,1.0],
+        let observation = serde_json::json!({"x":0.25,"y":0.75,"gaze_direction":[0.0,0.0,-1.0],
             "confidence":1.0,"timestamp_ms":0})
         .to_string();
         let mut buffer = EyeBuffer::default();

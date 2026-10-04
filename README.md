@@ -32,12 +32,15 @@ and [`assets/models/openvino/NOTICE.md`](assets/models/openvino/NOTICE.md).
 
 ```powershell
 cargo test
-cargo run -- --training
+cargo run --release -- --training
 cargo build --release
 ```
 
 `eyeos.exe` is at `target\release\eyeos.exe`. The first build needs Rust stable, Visual
 Studio Build Tools with the C++ desktop workload, and the Windows 11 SDK.
+Use the release build for webcam tracking. Debug builds can reduce processing
+throughput. A frame rate below 25 FPS is advisory and may lengthen calibration;
+freshness, image quality, and independent precision validation determine usability.
 
 ## Commands
 

@@ -11,6 +11,7 @@ use openvino::{CompiledModel, Core, DeviceType, ElementType, InferRequest, Shape
 use sha2::{Digest, Sha256};
 
 use crate::vision::{EyeFeatures, LANDMARK_COUNT, Landmark, LandmarkFrame};
+use eye_tracker_core::{Point, Quality, normalize_gaze_vector};
 
 const IMAGE_SIDE: usize = 60;
 const IMAGE_VALUES: usize = 3 * IMAGE_SIDE * IMAGE_SIDE;
@@ -172,6 +173,8 @@ pub struct GazeEstimator {
     left_eye_input: Tensor,
     right_eye_input: Tensor,
     head_angles_input: Tensor,
+    // Hold dependencies until after all OpenVINO handles have been dropped.
+    _runtime_dependencies: Vec<libloading::os::windows::Library>,
 }
 
 impl GazeEstimator {
@@ -182,7 +185,7 @@ impl GazeEstimator {
         let model_directory = profile_root.join("models").join("openvino");
         extract_assets(&model_directory, MODEL_ASSETS)?;
 
-        configure_dll_directory(&runtime_directory)?;
+        let runtime_dependencies = load_runtime_dependencies(&runtime_directory)?;
         openvino_sys::library::load_from(runtime_directory.join("openvino_c.dll"))
             .map_err(|error| anyhow!("loading bundled OpenVINO runtime: {error}"))?;
 
@@ -221,6 +224,7 @@ impl GazeEstimator {
             left_eye_input: image_tensor()?,
             right_eye_input: image_tensor()?,
             head_angles_input: tensor(&[1, 3])?,
+            _runtime_dependencies: runtime_dependencies,
         })
     }
 
@@ -236,13 +240,27 @@ impl GazeEstimator {
         height: u32,
         landmarks: &LandmarkFrame,
     ) -> Result<EyeFeatures> {
+        let started = std::time::Instant::now();
         let landmark_confidence = crop_landmark_confidence(landmarks)?;
         if rgb.len() < width as usize * height as usize * 3 {
             bail!("camera RGB frame is shorter than its declared resolution")
         }
         let face = face_crop(landmarks, width, height)?;
-        let left = eye_crop(landmarks, width, height, LEFT_EYE_OUTER, LEFT_EYE_INNER)?;
-        let right = eye_crop(landmarks, width, height, RIGHT_EYE_OUTER, RIGHT_EYE_INNER)?;
+        let mut left = eye_crop(landmarks, width, height, LEFT_EYE_OUTER, LEFT_EYE_INNER)?;
+        let mut right = eye_crop(landmarks, width, height, RIGHT_EYE_OUTER, RIGHT_EYE_INNER)?;
+        let (left_iris, left_opening) =
+            eye_geometry(landmarks, width, height, 33, 133, 159, 145, 468..473)?;
+        let (right_iris, right_opening) =
+            eye_geometry(landmarks, width, height, 362, 263, 386, 374, 473..478)?;
+        let blink = left_opening < 0.075 || right_opening < 0.075;
+        if blink {
+            bail!("blink or occluded eye; gaze unavailable")
+        }
+        let image_score = eye_image_quality(rgb, width, height, left)?
+            .min(eye_image_quality(rgb, width, height, right)?);
+        if image_score < 0.35 {
+            bail!("eye crops are too dark, overexposed, or lack contrast")
+        }
 
         fill_image_tensor(&mut self.head_input, rgb, width, height, face)?;
         self.head_request
@@ -256,16 +274,23 @@ impl GazeEstimator {
             scalar_output(&self.head_request, "angle_p_fc")?,
             scalar_output(&self.head_request, "angle_r_fc")?,
         ];
-        if angles
-            .iter()
-            .any(|angle| !angle.is_finite() || angle.abs() > 90.0)
+        if angles.iter().any(|angle| !angle.is_finite())
+            || angles[0].abs() > 45.0
+            || angles[1].abs() > 35.0
+            || angles[2].abs() > 35.0
         {
             bail!("head-pose model produced an implausible angle")
         }
 
+        // Same roll alignment as Intel's reference: rotate both crops by head
+        // roll, pass zero roll to the network, then rotate its output back.
+        left.rotation_radians = angles[2].to_radians();
+        right.rotation_radians = left.rotation_radians;
+        validate_crop(left, width, height)?;
+        validate_crop(right, width, height)?;
         fill_image_tensor(&mut self.left_eye_input, rgb, width, height, left)?;
         fill_image_tensor(&mut self.right_eye_input, rgb, width, height, right)?;
-        fill_tensor(&mut self.head_angles_input, &angles)?;
+        fill_tensor(&mut self.head_angles_input, &[angles[0], angles[1], 0.0])?;
         self.gaze_request
             .set_tensor("left_eye_image", &self.left_eye_input)
             .context("setting the left eye input")?;
@@ -291,27 +316,35 @@ impl GazeEstimator {
 
         // Gaze-estimation-adas-0002's vector is expressed in the camera reference frame. Undo
         // head roll before projection so a small head tilt does not look like a screen movement.
-        let roll = angles[2].to_radians();
-        let gaze_x = vector[0] * roll.cos() + vector[1] * roll.sin();
-        let gaze_y = -vector[0] * roll.sin() + vector[1] * roll.cos();
-        let gaze_z = vector[2].abs();
-        let magnitude =
-            (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
-        if gaze_z < 0.05 || !(0.55..=1.45).contains(&magnitude) {
-            bail!("gaze-vector quality gate rejected this frame")
-        }
-
-        let vector_quality = (1.0 - (magnitude - 1.0).abs() * 2.0).clamp(0.0, 1.0);
+        let direction = normalize_gaze_vector([vector[0], vector[1], vector[2]], angles[2])
+            .ok_or_else(|| anyhow!("invalid or backward-facing gaze direction"))?;
+        // This is an image/geometry quality score, never a vector-norm probability.
+        let confidence = image_score.min(landmark_confidence.unwrap_or(1.0));
         Ok(EyeFeatures {
-            x: f64::from(gaze_x / gaze_z),
-            y: f64::from(gaze_y / gaze_z),
-            confidence: landmark_confidence * vector_quality,
+            x: direction[0] / direction[2],
+            y: direction[1] / direction[2],
+            gaze_direction: direction,
+            head_pose: angles.map(f64::from),
+            left_iris: Some(left_iris),
+            right_iris: Some(right_iris),
+            face_center: Point::new(
+                f64::from(face.center_x / width as f32),
+                f64::from(face.center_y / height as f32),
+            ),
+            face_scale: f64::from(face.side / width.max(height) as f32),
+            confidence,
+            quality: Quality {
+                landmark_confidence,
+                image_score,
+                eye_opening: [left_opening, right_opening],
+                crops_valid: true,
+            },
             // This binocular OpenVINO network needs two eye crops. A missing eye is rejected
             // instead of inventing a gaze coordinate from landmark position.
             one_eye_fallback: false,
-            // Blink is intentionally not used as a calibration trigger or an input command.
-            // Closed eyes fail the image-model confidence gate and no sample is emitted.
-            blink: false,
+            blink,
+            timestamp_ms: landmarks.timestamp_ms,
+            inference_latency_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     }
 }
@@ -414,18 +447,11 @@ fn eye_crop(
     if distance < 8.0 {
         bail!("eye is too small for reliable gaze estimation")
     }
-    let mut rotation = dy.atan2(dx);
-    // The crop should follow eye tilt, but never rotate by 180 degrees and mirror one eye.
-    if rotation > std::f32::consts::FRAC_PI_2 {
-        rotation -= std::f32::consts::PI;
-    } else if rotation < -std::f32::consts::FRAC_PI_2 {
-        rotation += std::f32::consts::PI;
-    }
     Ok(Crop {
         center_x: (first_x + second_x) * 0.5,
         center_y: (first_y + second_y) * 0.5,
         side: distance * 1.85,
-        rotation_radians: rotation,
+        rotation_radians: 0.0,
     })
 }
 
@@ -445,17 +471,100 @@ fn landmark(frame: &LandmarkFrame, index: usize) -> Result<Landmark> {
     Ok(point)
 }
 
-fn crop_landmark_confidence(frame: &LandmarkFrame) -> Result<f32> {
-    let mut confidence = frame.face_confidence.clamp(0.0, 1.0);
+fn eye_geometry(
+    frame: &LandmarkFrame,
+    width: u32,
+    height: u32,
+    outer: usize,
+    inner: usize,
+    upper: usize,
+    lower: usize,
+    iris: std::ops::Range<usize>,
+) -> Result<(Point, f32)> {
+    let pixel = |i| -> Result<Point> {
+        let p = landmark(frame, i)?;
+        Ok(Point::new(
+            f64::from(p.x) * f64::from(width),
+            f64::from(p.y) * f64::from(height),
+        ))
+    };
+    let a = pixel(outer)?;
+    let b = pixel(inner)?;
+    let eye_width = a.distance_to(b);
+    if eye_width < 8.0 {
+        bail!("eye is too small")
+    }
+    // Both eyes use image-left to image-right coordinates, with no mirrored eye.
+    let (a, b) = if a.x <= b.x { (a, b) } else { (b, a) };
+    let u = Point::new((b.x - a.x) / eye_width, (b.y - a.y) / eye_width);
+    let points: Vec<_> = iris.map(pixel).collect::<Result<_>>()?;
+    let center = Point::new(
+        points.iter().map(|p| p.x).sum::<f64>() / points.len() as f64,
+        points.iter().map(|p| p.y).sum::<f64>() / points.len() as f64,
+    );
+    let displacement = Point::new(center.x - a.x, center.y - a.y);
+    let normalized = Point::new(
+        (displacement.x * u.x + displacement.y * u.y) / eye_width,
+        (-displacement.x * u.y + displacement.y * u.x) / eye_width,
+    );
+    Ok((
+        normalized,
+        (pixel(upper)?.distance_to(pixel(lower)?) / eye_width) as f32,
+    ))
+}
+
+fn validate_crop(crop: Crop, width: u32, height: u32) -> Result<()> {
+    let half =
+        crop.side * 0.5 * (crop.rotation_radians.cos().abs() + crop.rotation_radians.sin().abs());
+    if crop.center_x - half < 0.0
+        || crop.center_y - half < 0.0
+        || crop.center_x + half >= width as f32 - 1.0
+        || crop.center_y + half >= height as f32 - 1.0
+    {
+        bail!("eye crop crosses the camera boundary")
+    }
+    Ok(())
+}
+
+fn eye_image_quality(rgb: &[u8], width: u32, height: u32, crop: Crop) -> Result<f32> {
+    validate_crop(crop, width, height)?;
+    let mut values = Vec::with_capacity(144);
+    for y in 0..12 {
+        for x in 0..12 {
+            let px = crop.center_x + crop.side * ((x as f32 + 0.5) / 12.0 - 0.5);
+            let py = crop.center_y + crop.side * ((y as f32 + 0.5) / 12.0 - 0.5);
+            let [r, g, b] = bilinear_rgb(rgb, width, height, px, py);
+            values.push(0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b));
+        }
+    }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32;
+    let clipped =
+        values.iter().filter(|v| **v < 5.0 || **v > 250.0).count() as f32 / values.len() as f32;
+    Ok((variance.sqrt() / 12.0)
+        .clamp(0.0, 1.0)
+        .min((mean / 35.0).clamp(0.0, 1.0))
+        .min(((255.0 - mean) / 20.0).clamp(0.0, 1.0))
+        * (1.0 - clipped))
+}
+
+fn crop_landmark_confidence(frame: &LandmarkFrame) -> Result<Option<f32>> {
+    let mut confidence = frame
+        .face_confidence
+        .is_finite()
+        .then_some(frame.face_confidence.clamp(0.0, 1.0));
     for index in [
         LEFT_EYE_OUTER,
         LEFT_EYE_INNER,
         RIGHT_EYE_INNER,
         RIGHT_EYE_OUTER,
     ] {
-        confidence = confidence.min(landmark(frame, index)?.confidence.clamp(0.0, 1.0));
+        let value = landmark(frame, index)?.confidence;
+        if value.is_finite() {
+            confidence = Some(confidence.unwrap_or(1.0).min(value.clamp(0.0, 1.0)));
+        }
     }
-    if confidence < 0.50 {
+    if confidence.is_some_and(|v| v < 0.50) {
         bail!("MediaPipe eye geometry confidence was too low for gaze crops")
     }
     Ok(confidence)
@@ -540,23 +649,34 @@ fn extract_assets(directory: &Path, assets: &[EmbeddedAsset]) -> Result<()> {
     Ok(())
 }
 
-fn configure_dll_directory(runtime_directory: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW;
-
-        let wide: Vec<u16> = runtime_directory
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        if unsafe { SetDllDirectoryW(wide.as_ptr()) } == 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("adding the managed OpenVINO folder to Windows DLL search");
+fn load_runtime_dependencies(
+    runtime_directory: &Path,
+) -> Result<Vec<libloading::os::windows::Library>> {
+    use libloading::os::windows::Library;
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+    let directory =
+        fs::canonicalize(runtime_directory).context("resolving native runtime directory")?;
+    let mut libraries = Vec::new();
+    // Full-path loads retain dependencies without changing the host's DLL search directory.
+    for name in [
+        "tbb12.dll",
+        "tbbmalloc.dll",
+        "openvino.dll",
+        "openvino_intel_cpu_plugin.dll",
+        "openvino_ir_frontend.dll",
+    ] {
+        let library = unsafe {
+            Library::load_with_flags(
+                directory.join(name),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
         }
+        .with_context(|| format!("loading native dependency {name}"))?;
+        libraries.push(library);
     }
-    Ok(())
+    Ok(libraries)
 }
 
 fn display_path(path: &Path) -> String {
@@ -646,12 +766,27 @@ mod tests {
             y: 0.45,
             ..landmarks[RIGHT_EYE_OUTER]
         };
+        for (upper, lower) in [(159, 145), (386, 374)] {
+            landmarks[upper].y = 0.43;
+            landmarks[lower].y = 0.47;
+        }
         let frame = LandmarkFrame {
             landmarks,
             timestamp_ms: 0,
             face_confidence: 1.0,
         };
-        let rgb = vec![128_u8; 640 * 480 * 3];
+        // Real quality gates reject constant grey images. This fixture verifies
+        // preprocessing/runtime plumbing, not gaze accuracy on an artificial face.
+        let rgb: Vec<u8> = (0..640 * 480)
+            .flat_map(|i| {
+                let value = if ((i % 640) / 4 + (i / 640) / 4) % 2 == 0 {
+                    70
+                } else {
+                    190
+                };
+                [value, value, value]
+            })
+            .collect();
         let feature = estimator
             .estimate(&rgb, 640, 480, &frame)
             .expect("both local models must run on a valid RGB frame");

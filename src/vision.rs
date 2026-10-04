@@ -6,8 +6,6 @@ use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
-use crate::gaze::GazeSample;
-
 pub const LANDMARK_COUNT: usize = 478;
 pub const FACE_LANDMARKER_MODEL_SHA256: &str =
     "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff";
@@ -42,14 +40,7 @@ pub struct LandmarkFrame {
     pub face_confidence: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EyeFeatures {
-    pub x: f64,
-    pub y: f64,
-    pub confidence: f32,
-    pub one_eye_fallback: bool,
-    pub blink: bool,
-}
+pub use eye_tracker_core::Observation as EyeFeatures;
 
 /// Translate iris position into a head-pose-tolerant normalized feature. Screen calibration maps
 /// this feature to pixels; it is not treated as a universal gaze coordinate.
@@ -72,6 +63,7 @@ pub fn extract_eye_features(frame: &LandmarkFrame) -> Option<EyeFeatures> {
             confidence: frame.face_confidence.min(left.2).min(right.2),
             one_eye_fallback: false,
             blink,
+            ..EyeFeatures::default()
         }),
         (Some(eye), None) | (None, Some(eye)) => Some(EyeFeatures {
             x: eye.0,
@@ -79,6 +71,7 @@ pub fn extract_eye_features(frame: &LandmarkFrame) -> Option<EyeFeatures> {
             confidence: frame.face_confidence.min(eye.2) * 0.85,
             one_eye_fallback: true,
             blink,
+            ..EyeFeatures::default()
         }),
         (None, None) => None,
     }
@@ -135,18 +128,6 @@ fn normalized_iris(
         f64::from((iris_y - eye_center_y) / width),
         confidence,
     ))
-}
-
-pub fn calibrated_sample(
-    features: EyeFeatures,
-    calibration: &crate::CalibrationProfile,
-    timestamp_ms: u64,
-) -> GazeSample {
-    GazeSample {
-        position: calibration.map(features.x, features.y),
-        confidence: features.confidence,
-        timestamp_ms,
-    }
 }
 
 /// The official Face Landmarker task bundle is compiled into EyeOS. The tracker passes these

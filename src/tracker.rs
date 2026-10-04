@@ -5,11 +5,16 @@
 //! and model output never leave this process or get persisted.
 
 use std::{
+    collections::VecDeque,
     ffi::{CStr, c_char, c_void},
     fs,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,7 +37,7 @@ const MEDIAPIPE_RUNTIME: &[u8] = include_bytes!(concat!(
     "/assets/runtime/mediapipe/libmediapipe.dll"
 ));
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum TrackerStatus {
     Starting,
     CameraReady {
@@ -69,45 +74,101 @@ pub enum TrackerEvent {
 }
 
 /// Owns the communication channels for the local capture/inference worker.
+#[derive(Clone)]
+pub(crate) struct EventSender {
+    shared: Arc<EventMailbox>,
+}
+struct EventMailbox {
+    pending: Mutex<VecDeque<TrackerEvent>>,
+    closed: AtomicBool,
+}
+impl EventSender {
+    pub(crate) fn send(&self, event: TrackerEvent) -> Result<(), ()> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(());
+        }
+        let mut pending = self.shared.pending.lock().map_err(|_| ())?;
+        let failure = matches!(
+            &event,
+            TrackerEvent::Status(
+                TrackerStatus::NoFace
+                    | TrackerStatus::GazeUnavailable { .. }
+                    | TrackerStatus::CameraRetrying { .. }
+                    | TrackerStatus::Failed(_)
+                    | TrackerStatus::Stopped
+            )
+        );
+        if failure || matches!(&event, TrackerEvent::Features { .. }) {
+            pending.retain(|e| !matches!(e, TrackerEvent::Features { .. }));
+        }
+        if pending.len() >= 16 {
+            pending.pop_front();
+        }
+        pending.push_back(event);
+        Ok(())
+    }
+}
+
 pub struct LocalTracker {
-    events: Receiver<TrackerEvent>,
+    events: Arc<EventMailbox>,
     stop: Sender<()>,
 }
 
 impl LocalTracker {
     pub fn start(profile_root: PathBuf, camera_index: u32) -> Result<Self> {
+        Self::start_at(profile_root, camera_index, Instant::now())
+    }
+    pub fn start_at(profile_root: PathBuf, camera_index: u32, clock: Instant) -> Result<Self> {
         #[cfg(feature = "camera")]
         {
             let runtime_path = extract_runtime(&profile_root)?;
-            let (event_tx, events) = mpsc::channel();
+            let events = Arc::new(EventMailbox {
+                pending: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+            });
+            let event_tx = EventSender {
+                shared: events.clone(),
+            };
             let (stop, stop_rx) = mpsc::channel();
             thread::Builder::new()
                 .name("eyeos-face-tracker".to_owned())
                 .spawn(move || {
-                    run_worker(runtime_path, profile_root, camera_index, event_tx, stop_rx)
+                    run_worker(
+                        runtime_path,
+                        profile_root,
+                        camera_index,
+                        event_tx,
+                        stop_rx,
+                        clock,
+                    )
                 })
                 .context("starting the local eye-tracking worker")?;
             Ok(Self { events, stop })
         }
         #[cfg(not(feature = "camera"))]
         {
-            let _ = (profile_root, camera_index);
+            let _ = (profile_root, camera_index, clock);
             Err(anyhow!("camera support was excluded at build time"))
         }
     }
 
     pub fn drain(&self) -> Vec<TrackerEvent> {
-        self.events.try_iter().collect()
+        self.events
+            .pending
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
     }
 }
 
 impl Drop for LocalTracker {
     fn drop(&mut self) {
+        self.events.closed.store(true, Ordering::Release);
         let _ = self.stop.send(());
     }
 }
 
-fn extract_runtime(profile_root: &Path) -> Result<PathBuf> {
+pub(crate) fn extract_runtime(profile_root: &Path) -> Result<PathBuf> {
     if sha256_hex(MEDIAPIPE_RUNTIME) != MEDIAPIPE_RUNTIME_SHA256 {
         bail!("the embedded MediaPipe runtime did not match its pinned SHA-256")
     }
@@ -149,8 +210,9 @@ fn run_worker(
     runtime_path: PathBuf,
     profile_root: PathBuf,
     camera_index: u32,
-    event_tx: Sender<TrackerEvent>,
+    event_tx: EventSender,
     stop_rx: Receiver<()>,
+    clock: Instant,
 ) {
     let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::Starting));
     let result = (|| {
@@ -162,6 +224,7 @@ fn run_worker(
             camera_index,
             &event_tx,
             &stop_rx,
+            clock,
         )
     })();
     match result {
@@ -182,8 +245,9 @@ fn run_worker_inner(
     runtime_path: &Path,
     gaze_estimator: &mut GazeEstimator,
     camera_index: u32,
-    event_tx: &Sender<TrackerEvent>,
+    event_tx: &EventSender,
     stop_rx: &Receiver<()>,
+    clock: Instant,
 ) -> Result<()> {
     use nokhwa::{
         pixel_format::RgbFormat,
@@ -212,6 +276,7 @@ fn run_worker_inner(
             requested,
             event_tx,
             stop_rx,
+            clock,
         ) {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -238,120 +303,27 @@ fn run_capture_session(
     gaze_estimator: &mut GazeEstimator,
     camera_index: nokhwa::utils::CameraIndex,
     requested: nokhwa::utils::RequestedFormat<'static>,
-    event_tx: &Sender<TrackerEvent>,
+    event_tx: &EventSender,
     stop_rx: &Receiver<()>,
+    clock: Instant,
 ) -> Result<()> {
-    use nokhwa::{Camera, pixel_format::RgbFormat};
-
-    let mut camera = Camera::new(camera_index, requested)
-        .map_err(|error| anyhow!("opening the webcam: {error}"))?;
-    camera
-        .open_stream()
-        .map_err(|error| anyhow!("starting the webcam stream: {error}"))?;
-    let resolution = camera.resolution();
-    let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::CameraReady {
-        width: resolution.width_x,
-        height: resolution.height_y,
-        fps: camera.frame_rate(),
-        format: camera.frame_format().to_string(),
-    }));
-
-    let started = Instant::now();
-    let mut measured_at = started;
-    let mut completed_frames = 0_u32;
-    let mut last_no_face_at = started;
-    let mut last_gaze_error_at = started;
-    let mut consecutive_frame_errors = 0_u8;
-    loop {
-        match stop_rx.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => return Ok(()),
-            Err(TryRecvError::Empty) => {}
-        }
-
-        let frame = match camera.frame() {
-            Ok(frame) => {
-                consecutive_frame_errors = 0;
-                frame
-            }
-            Err(error) => {
-                consecutive_frame_errors = consecutive_frame_errors.saturating_add(1);
-                if consecutive_frame_errors < 5 {
-                    thread::sleep(Duration::from_millis(80));
-                    continue;
-                }
-                return Err(anyhow!(
-                    "the webcam did not provide a frame after {consecutive_frame_errors} retries: {error}"
-                ));
-            }
-        };
-        let resolution = frame.resolution();
-        let rgb = frame
-            .decode_image::<RgbFormat>()
-            .map_err(|error| anyhow!("converting the webcam frame to RGB: {error}"))?;
-        let timestamp_ms = started.elapsed().as_millis() as u64;
-        match landmarker.detect_rgb(
-            rgb.as_raw(),
-            resolution.width_x as i32,
-            resolution.height_y as i32,
-            timestamp_ms,
-        )? {
-            Some(landmarks) => {
-                match gaze_estimator.estimate(
-                    rgb.as_raw(),
-                    resolution.width_x,
-                    resolution.height_y,
-                    &landmarks,
-                ) {
-                    Ok(features) => {
-                        if event_tx
-                            .send(TrackerEvent::Features {
-                                features,
-                                timestamp_ms,
-                            })
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(error) if last_gaze_error_at.elapsed().as_millis() >= 250 => {
-                        let _ =
-                            event_tx.send(TrackerEvent::Status(TrackerStatus::GazeUnavailable {
-                                detail: error.to_string(),
-                            }));
-                        last_gaze_error_at = Instant::now();
-                    }
-                    Err(_) => {}
-                }
-            }
-            None if last_no_face_at.elapsed().as_millis() >= 250 => {
-                let _ = event_tx.send(TrackerEvent::Status(TrackerStatus::NoFace));
-                last_no_face_at = Instant::now();
-            }
-            None => {}
-        }
-
-        completed_frames += 1;
-        let elapsed = measured_at.elapsed();
-        if elapsed.as_millis() >= 1_000 {
-            let fps = completed_frames as f32 / elapsed.as_secs_f32();
-            let status = if fps >= 25.0 {
-                TrackerStatus::Tracking { fps }
-            } else {
-                TrackerStatus::LowFrameRate { fps }
-            };
-            let _ = event_tx.send(TrackerEvent::Status(status));
-            measured_at = Instant::now();
-            completed_frames = 0;
-        }
-    }
+    crate::capture::run(
+        landmarker,
+        gaze_estimator,
+        camera_index,
+        requested,
+        event_tx,
+        stop_rx,
+        clock,
+    )
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type MpFaceLandmarkerPtr = *mut c_void;
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type MpImagePtr = *mut c_void;
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 #[repr(C)]
 struct BaseOptions {
     model_asset_buffer: *const c_char,
@@ -364,7 +336,7 @@ struct BaseOptions {
     ca_bundle_path: *const c_char,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 #[repr(C)]
 struct FaceLandmarkerOptions {
     base_options: BaseOptions,
@@ -379,7 +351,7 @@ struct FaceLandmarkerOptions {
         Option<unsafe extern "C" fn(i32, *const FaceLandmarkerResult, MpImagePtr, i64)>,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 #[repr(C)]
 struct NormalizedLandmark {
     x: f32,
@@ -392,14 +364,14 @@ struct NormalizedLandmark {
     name: *mut c_char,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 #[repr(C)]
 struct NormalizedLandmarks {
     landmarks: *mut NormalizedLandmark,
     landmarks_count: u32,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 #[repr(C)]
 struct FaceLandmarkerResult {
     face_landmarks: *mut NormalizedLandmarks,
@@ -410,13 +382,13 @@ struct FaceLandmarkerResult {
     facial_transformation_matrixes_count: u32,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type CreateLandmarker = unsafe extern "C" fn(
     *mut FaceLandmarkerOptions,
     *mut MpFaceLandmarkerPtr,
     *mut *mut c_char,
 ) -> i32;
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type DetectForVideo = unsafe extern "C" fn(
     MpFaceLandmarkerPtr,
     MpImagePtr,
@@ -425,20 +397,20 @@ type DetectForVideo = unsafe extern "C" fn(
     *mut FaceLandmarkerResult,
     *mut *mut c_char,
 ) -> i32;
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type CloseResult = unsafe extern "C" fn(*mut FaceLandmarkerResult);
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type CloseLandmarker = unsafe extern "C" fn(MpFaceLandmarkerPtr, *mut *mut c_char) -> i32;
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type CreateImage =
     unsafe extern "C" fn(i32, i32, i32, *const u8, i32, *mut MpImagePtr, *mut *mut c_char) -> i32;
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type FreeImage = unsafe extern "C" fn(MpImagePtr);
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 type FreeError = unsafe extern "C" fn(*mut c_char);
 
-#[cfg(feature = "camera")]
-struct MediaPipeFaceLandmarker {
+#[cfg(feature = "native")]
+pub(crate) struct MediaPipeFaceLandmarker {
     _library: Library,
     create_landmarker: CreateLandmarker,
     detect_for_video: DetectForVideo,
@@ -450,9 +422,9 @@ struct MediaPipeFaceLandmarker {
     handle: MpFaceLandmarkerPtr,
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 impl MediaPipeFaceLandmarker {
-    fn load(runtime_path: &Path) -> Result<Self> {
+    pub(crate) fn load(runtime_path: &Path) -> Result<Self> {
         let library = unsafe { Library::new(runtime_path) }
             .with_context(|| format!("loading {}", runtime_path.display()))?;
         let create_landmarker = unsafe { load_symbol(&library, b"MpFaceLandmarkerCreate\0")? };
@@ -515,7 +487,7 @@ impl MediaPipeFaceLandmarker {
         Ok(())
     }
 
-    fn detect_rgb(
+    pub(crate) fn detect_rgb(
         &self,
         rgb: &[u8],
         width: i32,
@@ -590,16 +562,15 @@ impl MediaPipeFaceLandmarker {
                 confidence: if landmark.has_presence {
                     landmark.presence.clamp(0.0, 1.0)
                 } else {
-                    0.95
+                    f32::NAN
                 },
             })
             .collect();
         Ok(Some(LandmarkFrame {
             landmarks,
             timestamp_ms,
-            // The C result contains no overall confidence. The task thresholds and the iris
-            // point presences above form the conservative confidence gate used by EyeOS.
-            face_confidence: 0.95,
+            // Unknown confidence is preserved; task thresholds are not a measured score.
+            face_confidence: f32::NAN,
         }))
     }
 
@@ -623,7 +594,7 @@ impl MediaPipeFaceLandmarker {
     }
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 impl Drop for MediaPipeFaceLandmarker {
     fn drop(&mut self) {
         if self.handle.is_null() {
@@ -638,7 +609,7 @@ impl Drop for MediaPipeFaceLandmarker {
     }
 }
 
-#[cfg(feature = "camera")]
+#[cfg(feature = "native")]
 unsafe fn load_symbol<T: Copy>(library: &Library, name: &[u8]) -> Result<T> {
     let symbol = unsafe { library.get::<T>(name) }
         .with_context(|| format!("resolving MediaPipe export {:?}", name))?;
@@ -654,7 +625,7 @@ mod tests {
         assert_eq!(sha256_hex(MEDIAPIPE_RUNTIME), MEDIAPIPE_RUNTIME_SHA256);
     }
 
-    #[cfg(feature = "camera")]
+    #[cfg(feature = "native")]
     #[test]
     fn ffi_layout_matches_the_pinned_mediapipe_headers_on_x64() {
         use std::mem::size_of;

@@ -6,25 +6,40 @@ rust-version = "1.88"
 description = "Offline, safety-first Windows desktop eye-control prototype"
 license = "MIT OR Apache-2.0"
 
+[workspace]
+members = ["crates/eye-tracker-core"]
+resolver = "3"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "eyeos"
+path = "src/main.rs"
+required-features = ["desktop", "camera"]
+
 [features]
-default = ["camera"]
-camera = ["dep:nokhwa"]
+default = ["desktop", "camera"]
+desktop = ["dep:clap", "dep:directories", "dep:eframe", "dep:egui"]
+native = ["dep:libloading", "dep:openvino", "dep:openvino-sys", "dep:sha2"]
+camera = ["native", "dep:nokhwa"]
 onnx = ["dep:ort"]
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }
-directories = "6.0"
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
-egui = "0.31"
-libloading = "0.8"
+eye-tracker-core = { path = "crates/eye-tracker-core" }
+clap = { version = "4.5", features = ["derive"], optional = true }
+directories = { version = "6.0", optional = true }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"], optional = true }
+egui = { version = "0.31", optional = true }
+libloading = { version = "0.8", optional = true }
 nokhwa = { version = "0.10.11", default-features = false, features = ["input-msmf", "decoding"], optional = true }
-openvino = { version = "0.11", features = ["runtime-linking"] }
-openvino-sys = { version = "0.11", features = ["runtime-linking"] }
+openvino = { version = "0.11", features = ["runtime-linking"], optional = true }
+openvino-sys = { version = "0.11", features = ["runtime-linking"], optional = true }
 ort = { version = "2.0.0-rc.12", default-features = false, features = ["std", "ndarray"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = { version = "0.10", optional = true }
 thiserror = "2.0"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
@@ -43,5 +58,5 @@ tempfile = "3.20"
 [profile.release]
 codegen-units = 1
 lto = "thin"
-panic = "abort"
+panic = "unwind"
 strip = "symbols"

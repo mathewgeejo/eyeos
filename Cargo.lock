@@ -774,6 +774,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
+name = "eye-tracker-core"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eyeos"
 version = "0.1.0"
 dependencies = [
@@ -782,6 +790,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "eye-tracker-core",
  "libloading",
  "nokhwa",
  "openvino",

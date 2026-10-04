@@ -1,0 +1,12 @@
+{
+  "name": "@eyeos/tracker",
+  "version": "0.2.0",
+  "type": "module",
+  "main": "index.mjs",
+  "types": "index.d.ts",
+  "description": "Local webcam eye tracker for Node.js and Electron desktop applications",
+  "license": "(MIT OR Apache-2.0)",
+  "engines": { "node": ">=20" },
+  "dependencies": { "koffi": "^2.9.0" },
+  "scripts": { "test": "node --test test.mjs" }
+}

@@ -3,16 +3,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Vec2};
+use eye_tracker_core::{CALIBRATION_SAMPLES_PER_TARGET, CalibrationOutcome};
 use eyeos::{
-    CalibrationPoint, CalibrationProfile, ControlEngine, EngineEvent, GazeSample, InputAction,
-    InputController, InteractionMode, Point, SafetyState,
+    CalibrationProfile, ControlEngine, EngineEvent, EyeTracker, GazeSample, InputAction,
+    InputController, InteractionMode, Point, SafetyState, TrackerConfig, TrackingState,
     config::AppConfig,
     persistence::{ProfileStore, install_autostart},
-    tracker::{LocalTracker, TrackerEvent, TrackerStatus},
-    vision::{
-        CameraStatus, EyeFeatures, ModelStatus, calibrated_sample, detect_camera_status,
-        model_status,
-    },
+    tracker::TrackerStatus,
+    vision::{CameraStatus, EyeFeatures, ModelStatus, detect_camera_status, model_status},
 };
 
 const BLOB_SIZE: f32 = 80.0;
@@ -86,253 +84,6 @@ enum OverlayTarget {
     Key(KeyboardAction),
 }
 
-const CALIBRATION_SAMPLES_PER_TARGET: usize = 20;
-const STABLE_FEATURE_SPREAD: f64 = 0.012;
-const MIN_FEATURE_RANGE_X: f64 = 0.020;
-const MIN_FEATURE_RANGE_Y: f64 = 0.015;
-
-enum CalibrationPhase {
-    Mapping,
-    Validation {
-        profile: CalibrationProfile,
-        errors: Vec<f64>,
-    },
-}
-
-enum CalibrationOutcome {
-    Completed {
-        profile: CalibrationProfile,
-        validation_median_error_px: f64,
-        validation_median_error_cm: f64,
-    },
-    Rejected(String),
-}
-
-/// Calibration is only accepted after two independent checks:
-///
-/// 1. Every target needs a stable iris position and the nine positions must cover both axes.
-/// 2. A separately collected five-target pass must predict each target within the error limit.
-///
-/// A visible face alone therefore cannot produce a usable profile.
-struct CalibrationWizard {
-    targets: Vec<Point>,
-    validation_targets: Vec<Point>,
-    samples: Vec<CalibrationPoint>,
-    current: usize,
-    settle_until_ms: Option<u64>,
-    feature_samples: Vec<EyeFeatures>,
-    phase: CalibrationPhase,
-    maximum_fit_error_px: f64,
-    maximum_validation_error_px: f64,
-    pixels_per_cm: f64,
-}
-
-impl CalibrationWizard {
-    fn new(screen_size: Point, pixels_per_cm: f64) -> Self {
-        let mut targets = Vec::with_capacity(25);
-        for y in [0.08, 0.29, 0.5, 0.71, 0.92] {
-            for x in [0.08, 0.29, 0.5, 0.71, 0.92] {
-                targets.push(Point::new(screen_size.x * x, screen_size.y * y));
-            }
-        }
-        let validation_targets = [[0.2, 0.2], [0.8, 0.2], [0.5, 0.5], [0.2, 0.8], [0.8, 0.8]]
-            .into_iter()
-            .map(|[x, y]| Point::new(screen_size.x * x, screen_size.y * y))
-            .collect();
-        let diagonal = screen_size.x.hypot(screen_size.y);
-        Self {
-            targets,
-            validation_targets,
-            samples: Vec::with_capacity(25),
-            current: 0,
-            settle_until_ms: None,
-            feature_samples: Vec::with_capacity(CALIBRATION_SAMPLES_PER_TARGET),
-            phase: CalibrationPhase::Mapping,
-            maximum_fit_error_px: diagonal * 0.10,
-            // A profile has to demonstrate a two-centimetre median error on independent targets.
-            // The fallback density is a conventional 96-DPI estimate when Windows does not report
-            // the panel's physical size.
-            maximum_validation_error_px: (pixels_per_cm * 2.0).clamp(45.0, 90.0),
-            pixels_per_cm,
-        }
-    }
-
-    fn target(&self) -> Option<Point> {
-        match &self.phase {
-            CalibrationPhase::Mapping => self.targets.get(self.current).copied(),
-            CalibrationPhase::Validation { .. } => {
-                self.validation_targets.get(self.current).copied()
-            }
-        }
-    }
-
-    fn progress(&self) -> (usize, usize) {
-        let total = match &self.phase {
-            CalibrationPhase::Mapping => self.targets.len(),
-            CalibrationPhase::Validation { .. } => self.validation_targets.len(),
-        };
-        (self.current, total)
-    }
-
-    fn phase_label(&self) -> &'static str {
-        match &self.phase {
-            CalibrationPhase::Mapping => "Calibration",
-            CalibrationPhase::Validation { .. } => "Validation",
-        }
-    }
-
-    fn sample_progress(&self) -> usize {
-        self.feature_samples.len()
-    }
-
-    fn observe(&mut self, features: EyeFeatures, timestamp_ms: u64) -> Option<CalibrationOutcome> {
-        if self.target().is_none() {
-            return None;
-        }
-        if features.confidence < 0.72 || features.blink {
-            return None;
-        }
-        let settle_until = self
-            .settle_until_ms
-            .get_or_insert(timestamp_ms.saturating_add(900));
-        if timestamp_ms < *settle_until {
-            return None;
-        }
-        self.feature_samples.push(features);
-        if self.feature_samples.len() < CALIBRATION_SAMPLES_PER_TARGET {
-            return None;
-        }
-
-        let count = self.feature_samples.len() as f64;
-        let feature_x = self
-            .feature_samples
-            .iter()
-            .map(|sample| sample.x)
-            .sum::<f64>()
-            / count;
-        let feature_y = self
-            .feature_samples
-            .iter()
-            .map(|sample| sample.y)
-            .sum::<f64>()
-            / count;
-        let widest_sample = self
-            .feature_samples
-            .iter()
-            .map(|sample| (sample.x - feature_x).hypot(sample.y - feature_y))
-            .fold(0.0_f64, f64::max);
-        if widest_sample > STABLE_FEATURE_SPREAD {
-            self.feature_samples.clear();
-            self.settle_until_ms = Some(timestamp_ms.saturating_add(650));
-            return None;
-        }
-
-        let target = self.target().expect("target was checked above");
-        let mapping = matches!(&self.phase, CalibrationPhase::Mapping);
-        if mapping {
-            self.samples.push(CalibrationPoint {
-                feature_x,
-                feature_y,
-                screen_x: target.x,
-                screen_y: target.y,
-            });
-        } else {
-            let profile = match &self.phase {
-                CalibrationPhase::Validation { profile, .. } => profile,
-                CalibrationPhase::Mapping => unreachable!("mapping phase handled above"),
-            };
-            let error = profile.map(feature_x, feature_y).distance_to(target);
-            if let CalibrationPhase::Validation { errors, .. } = &mut self.phase {
-                errors.push(error);
-            }
-        }
-
-        self.current += 1;
-        self.feature_samples.clear();
-        self.settle_until_ms = Some(timestamp_ms.saturating_add(900));
-
-        if mapping && self.current == self.targets.len() {
-            let feature_range_x = feature_range(&self.samples, |sample| sample.feature_x);
-            let feature_range_y = feature_range(&self.samples, |sample| sample.feature_y);
-            if feature_range_x < MIN_FEATURE_RANGE_X || feature_range_y < MIN_FEATURE_RANGE_Y {
-                return Some(CalibrationOutcome::Rejected(
-                    "Calibration rejected: eye positions did not change enough between targets. Look at every dot, not just the camera."
-                        .to_owned(),
-                ));
-            }
-            let Some(profile) = CalibrationProfile::fit(&self.samples) else {
-                return Some(CalibrationOutcome::Rejected(
-                    "Calibration rejected: EyeOS could not fit a stable gaze map.".to_owned(),
-                ));
-            };
-            if profile.median_error_px > self.maximum_fit_error_px {
-                return Some(CalibrationOutcome::Rejected(format!(
-                    "Calibration rejected: fitting error was {:.0}px; repeat while following each dot.",
-                    profile.median_error_px
-                )));
-            }
-            self.phase = CalibrationPhase::Validation {
-                profile,
-                errors: Vec::with_capacity(self.validation_targets.len()),
-            };
-            self.current = 0;
-            return None;
-        }
-
-        if !mapping && self.current == self.validation_targets.len() {
-            let (mut profile, errors) = match &self.phase {
-                CalibrationPhase::Validation { profile, errors } => {
-                    (profile.clone(), errors.clone())
-                }
-                CalibrationPhase::Mapping => unreachable!("mapping phase handled above"),
-            };
-            let median_error = median_f64(errors);
-            if median_error <= self.maximum_validation_error_px {
-                let median_error_cm = median_error / self.pixels_per_cm;
-                profile.validation_median_error_px = median_error;
-                profile.validation_median_error_cm = median_error_cm;
-                profile.validation_passed = true;
-                return Some(CalibrationOutcome::Completed {
-                    profile,
-                    validation_median_error_px: median_error,
-                    validation_median_error_cm: median_error_cm,
-                });
-            }
-            return Some(CalibrationOutcome::Rejected(format!(
-                "Validation failed: median target error was {:.0}px ({:.2}cm); limit is {:.0}px ({:.2}cm). Repeat calibration and follow each dot.",
-                median_error,
-                median_error / self.pixels_per_cm,
-                self.maximum_validation_error_px,
-                self.maximum_validation_error_px / self.pixels_per_cm,
-            )));
-        }
-        None
-    }
-}
-
-fn feature_range(samples: &[CalibrationPoint], value: impl Fn(&CalibrationPoint) -> f64) -> f64 {
-    let Some(first) = samples.first() else {
-        return 0.0;
-    };
-    let (minimum, maximum) = samples
-        .iter()
-        .fold((value(first), value(first)), |range, sample| {
-            let current = value(sample);
-            (range.0.min(current), range.1.max(current))
-        });
-    maximum - minimum
-}
-
-fn median_f64(mut values: Vec<f64>) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let middle = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        (values[middle - 1] + values[middle]) / 2.0
-    } else {
-        values[middle]
-    }
-}
-
 struct EyeOsApp {
     store: ProfileStore,
     config: AppConfig,
@@ -348,9 +99,8 @@ struct EyeOsApp {
     status_message: String,
     dwell_progress: f32,
     calibration: Option<CalibrationProfile>,
-    tracker: Option<LocalTracker>,
+    tracker: Option<EyeTracker>,
     latest_features: Option<(EyeFeatures, u64)>,
-    calibration_wizard: Option<CalibrationWizard>,
     overlay_target: Option<OverlayTarget>,
     overlay_target_started_at: Option<u64>,
     overlay_cooldown_until: u64,
@@ -363,7 +113,20 @@ impl EyeOsApp {
         engine.dwell_ms = config.dwell_ms;
         engine.keyboard_dwell_ms = config.keyboard_dwell_ms;
 
-        let calibration = store.load_calibration().ok().flatten();
+        let mut tracker = EyeTracker::new(
+            tracking_config(screen_size, &config),
+            store.root().to_path_buf(),
+        )
+        .ok();
+        let calibration = store.load_calibration().ok().flatten().filter(|profile| {
+            tracker
+                .as_mut()
+                .is_some_and(|tracker| tracker.engine_mut().set_profile(profile.clone()).is_ok())
+        });
+        let started_at = tracker
+            .as_ref()
+            .map(|t| t.clock())
+            .unwrap_or_else(Instant::now);
         let model = model_status();
         let mut app = Self {
             store,
@@ -374,15 +137,14 @@ impl EyeOsApp {
             camera: detect_camera_status(),
             model,
             screen_size,
-            started_at: Instant::now(),
+            started_at,
             simulate_gaze,
             training_text: String::new(),
             status_message: "Looking for the local eye tracker…".to_owned(),
             dwell_progress: 0.0,
             calibration,
-            tracker: None,
+            tracker,
             latest_features: None,
-            calibration_wizard: None,
             overlay_target: None,
             overlay_target_started_at: None,
             overlay_cooldown_until: 0,
@@ -397,12 +159,13 @@ impl EyeOsApp {
             app.process_events(events);
             app.status_message = "Developer gaze simulation — dry-run only.".to_owned();
         } else {
-            match LocalTracker::start(app.store.root().to_path_buf(), app.config.camera_index) {
-                Ok(tracker) => app.tracker = Some(tracker),
-                Err(error) => {
+            if let Some(tracker) = app.tracker.as_mut() {
+                if let Err(error) = tracker.start_camera(app.config.camera_index) {
                     app.status_message = format!("Eye tracker could not start: {error}");
                     return app;
                 }
+            } else {
+                app.status_message = "Invalid tracker settings; review setup.".into();
             }
         }
 
@@ -416,7 +179,7 @@ impl EyeOsApp {
             app.process_events(events);
         } else if !app.simulate_gaze {
             app.status_message = if !app.has_validated_calibration() {
-                "Tracker starting — complete the 25-point gaze-vector calibration and independent validation.".to_owned()
+                "Tracker starting — complete quick calibration and independent precision validation.".to_owned()
             } else {
                 "Paused: caregiver confirmation is required before live input.".to_owned()
             };
@@ -1034,40 +797,127 @@ impl EyeOsApp {
         }
         ui.separator();
         if let Some(profile) = &self.calibration {
-            ui.label(format!(
-                "Gaze-vector calibration: {} samples, fit median {:.1}px; independent validation {:.1}px / {:.2}cm ({}).",
-                profile.sample_count,
-                profile.median_error_px,
-                profile.validation_median_error_px,
-                profile.validation_median_error_cm,
-                if profile.validation_passed { "passed" } else { "not passed" },
-            ));
+            if let Some(report) = &profile.accuracy {
+                ui.label(format!("Independent error: median {:.1}px, p95 {:.1}px; coverage {:.0}%; jitter {:.1}px; latency p95 {:.0}ms.",
+                    report.median_error_px, report.p95_error_px, report.valid_sample_coverage * 100.0,
+                    report.jitter_px, report.p95_latency_ms));
+                if let (Some(median), Some(p95)) = (report.median_error_deg, report.p95_error_deg) {
+                    ui.label(format!(
+                        "Estimated angular error: median {median:.2}, p95 {p95:.2} degrees ({}).",
+                        if profile.validation_passed {
+                            "precision passed"
+                        } else {
+                            "extra calibration needed"
+                        }
+                    ));
+                } else {
+                    ui.label("Enter display dimensions and viewing distance to validate angular precision.");
+                }
+                ui.label(format!(
+                    "Calibration retrieval: {}",
+                    if profile.retrieval_enabled {
+                        "enabled by grouped validation"
+                    } else {
+                        "baseline selected"
+                    }
+                ));
+            }
         } else {
-            ui.label("No calibration profile is stored yet.");
+            ui.label("A fresh calibration is required for the new tracking engine.");
         }
-        let ready_for_calibration = self.model == ModelStatus::Ready
-            && self.tracker.is_some()
+        ui.label("Enter actual display dimensions and eye-to-screen distance in millimetres. Angular error is an estimate.");
+        let mut width = self.config.screen_width_mm.unwrap_or(0.0);
+        let mut height = self.config.screen_height_mm.unwrap_or(0.0);
+        let mut distance = self.config.viewing_distance_mm.unwrap_or(0.0);
+        let changed = ui
+            .horizontal(|ui| {
+                let a = ui
+                    .add(
+                        egui::DragValue::new(&mut width)
+                            .speed(1.0)
+                            .prefix("Width mm: "),
+                    )
+                    .changed();
+                let b = ui
+                    .add(
+                        egui::DragValue::new(&mut height)
+                            .speed(1.0)
+                            .prefix("Height mm: "),
+                    )
+                    .changed();
+                let c = ui
+                    .add(
+                        egui::DragValue::new(&mut distance)
+                            .speed(1.0)
+                            .prefix("Distance mm: "),
+                    )
+                    .changed();
+                a || b || c
+            })
+            .inner;
+        if changed {
+            self.config.screen_width_mm = (width > 0.0).then_some(width);
+            self.config.screen_height_mm = (height > 0.0).then_some(height);
+            self.config.viewing_distance_mm = (distance > 0.0).then_some(distance);
+            let tracker_config = tracking_config(self.screen_size, &self.config);
+            if let Some(tracker) = self.tracker.as_mut() {
+                let _ = tracker.reconfigure(tracker_config);
+            }
+            self.calibration = None;
+            let events = self.engine.set_paused(true);
+            self.process_events(events);
+            self.save_config();
+        }
+        let ready = self.model == ModelStatus::Ready
+            && self.tracker.as_ref().is_some_and(|t| t.has_camera())
             && self.has_recent_eye_features();
-        if !ready_for_calibration {
+        if !ready {
             ui.colored_label(
                 Color32::YELLOW,
-                "Waiting for a usable camera and face/iris stream before calibration can begin.",
+                "Waiting for a usable binocular eye stream.",
             );
         }
-        ui.add_enabled_ui(ready_for_calibration, |ui| {
-            if ui
-                .button("Start 25-point gaze-vector calibration")
-                .clicked()
-            {
-                self.calibration_wizard = Some(CalibrationWizard::new(
-                    self.screen_size,
-                    primary_pixels_per_cm(),
-                ));
-                self.status_message =
-                    "Look at each target until EyeOS moves to the next one.".to_owned();
-                self.set_page(Page::Calibration, context);
+        if ui
+            .add_enabled(
+                ready,
+                egui::Button::new("Start quick personalized calibration"),
+            )
+            .clicked()
+        {
+            match self.tracker.as_mut().unwrap().start_calibration() {
+                Ok(()) => {
+                    self.calibration = None;
+                    let events = self.engine.set_paused(true);
+                    self.process_events(events);
+                    self.clear_overlay_target();
+                    self.set_page(Page::Calibration, context);
+                }
+                Err(error) => self.status_message = error,
             }
-        });
+        }
+        let extra = self
+            .tracker
+            .as_ref()
+            .and_then(|t| t.calibration_progress())
+            .is_some_and(|p| p.target.is_none() && !p.suggested_targets.is_empty());
+        if ui
+            .add_enabled(
+                ready && extra,
+                egui::Button::new("Add targeted calibration and revalidate"),
+            )
+            .clicked()
+        {
+            match self.tracker.as_mut().unwrap().extend_calibration() {
+                Ok(()) => {
+                    self.calibration = None;
+                    let events = self.engine.set_paused(true);
+                    self.process_events(events);
+                    self.clear_overlay_target();
+                    self.set_page(Page::Calibration, context);
+                }
+                Err(error) => self.status_message = error,
+            }
+        }
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
         }
@@ -1083,13 +933,13 @@ impl EyeOsApp {
     fn render_calibration(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-        let Some(wizard) = &self.calibration_wizard else {
+        let Some(wizard) = self.tracker.as_ref().and_then(|t| t.calibration_progress()) else {
             return;
         };
-        let Some(target) = wizard.target() else {
+        let Some(target) = wizard.target else {
             return;
         };
-        let (completed, total) = wizard.progress();
+        let (completed, total) = (wizard.completed, wizard.total);
         let target_position = Pos2::new(target.x as f32, target.y as f32);
         let target_colour = if self.config.high_contrast {
             Color32::WHITE
@@ -1105,7 +955,7 @@ impl EyeOsApp {
             Align2::CENTER_CENTER,
             format!(
                 "{}: look at the target  •  {} of {}",
-                wizard.phase_label(),
+                wizard.instruction,
                 completed + 1,
                 total
             ),
@@ -1117,8 +967,7 @@ impl EyeOsApp {
             Align2::CENTER_CENTER,
             format!(
                 "Hold your gaze on the dot: {}/{} stable gaze-vector samples",
-                wizard.sample_progress(),
-                CALIBRATION_SAMPLES_PER_TARGET
+                wizard.stable_samples, CALIBRATION_SAMPLES_PER_TARGET
             ),
             FontId::proportional(18.0),
             Color32::from_gray(210),
@@ -1194,81 +1043,93 @@ impl EyeOsApp {
     }
 
     fn poll_tracker(&mut self, context: &egui::Context) {
-        let events = self
-            .tracker
-            .as_ref()
-            .map(LocalTracker::drain)
-            .unwrap_or_default();
+        let events = match self.tracker.as_mut().map(|tracker| tracker.poll()) {
+            Some(Ok(events)) => events,
+            Some(Err(error)) => {
+                self.status_message = error;
+                let events = self.engine.update(GazeSample {
+                    position: Point::default(),
+                    confidence: 0.0,
+                    timestamp_ms: self.started_at.elapsed().as_millis() as u64,
+                });
+                self.process_events(events);
+                self.clear_overlay_target();
+                return;
+            }
+            None => return,
+        };
         for event in events {
-            match event {
-                TrackerEvent::Features {
-                    features,
-                    timestamp_ms,
-                } => {
-                    self.latest_features = Some((features, timestamp_ms));
-                    let calibration_outcome = self
-                        .calibration_wizard
-                        .as_mut()
-                        .and_then(|wizard| wizard.observe(features, timestamp_ms));
-                    if let Some(outcome) = calibration_outcome {
-                        match outcome {
-                            CalibrationOutcome::Completed {
-                                profile: calibration,
-                                validation_median_error_px,
-                                validation_median_error_cm,
-                            } => match self.store.save_calibration(&calibration) {
-                                Ok(()) => {
-                                    self.calibration = Some(calibration);
-                                    self.calibration_wizard = None;
-                                    self.status_message = format!(
-                                        "Calibration passed independent validation: median error {validation_median_error_px:.0}px / {validation_median_error_cm:.2}cm."
-                                    );
-                                    self.set_page(Page::Setup, context);
-                                }
-                                Err(error) => {
-                                    self.calibration_wizard = None;
-                                    self.status_message =
-                                        format!("Could not save calibration: {error}");
-                                    self.set_page(Page::Setup, context);
-                                }
-                            },
-                            CalibrationOutcome::Rejected(message) => {
-                                self.calibration_wizard = None;
-                                self.status_message = message;
-                                self.set_page(Page::Setup, context);
+            if let Some(observation) = event.observation {
+                self.latest_features = Some((observation, observation.timestamp_ms));
+            }
+            if let Some(status) = event.status {
+                self.status_message = tracker_status_message(status);
+            }
+            if let Some(outcome) = event.calibration {
+                match outcome {
+                    CalibrationOutcome::Completed { profile, report } => {
+                        self.status_message = if report.precision_passed {
+                            format!(
+                                "Precision validated: median {:.1}px, p95 {:.1}px.",
+                                report.median_error_px, report.p95_error_px
+                            )
+                        } else if report.median_error_deg.is_none() {
+                            "Pixel accuracy measured. Enter display size/viewing distance and repeat calibration to enable precision control.".into()
+                        } else {
+                            "Precision target missed. Add targeted calibration and revalidate; desktop control remains paused.".into()
+                        };
+                        if let Err(error) = self.store.save_calibration(&profile) {
+                            self.status_message = format!("Could not save calibration: {error}");
+                            if let Some(tracker) = self.tracker.as_mut() {
+                                tracker.engine_mut().clear_profile();
                             }
+                        } else {
+                            self.calibration = Some(profile);
                         }
-                    } else if self.calibration_wizard.is_none() {
-                        if let Some(calibration) = &self.calibration {
-                            self.process_gaze_sample(
-                                calibrated_sample(features, calibration, timestamp_ms),
-                                context,
-                            );
-                        }
+                        self.set_page(Page::Setup, context);
+                    }
+                    CalibrationOutcome::Rejected(error) => {
+                        self.status_message = error;
+                        self.set_page(Page::Setup, context);
                     }
                 }
-                TrackerEvent::Status(status) => {
-                    let tracking_failed = matches!(
-                        status,
-                        TrackerStatus::NoFace
-                            | TrackerStatus::LowFrameRate { .. }
-                            | TrackerStatus::GazeUnavailable { .. }
-                            | TrackerStatus::Failed(_)
-                    );
-                    if tracking_failed && self.engine.safety != SafetyState::Paused {
-                        let timestamp_ms = self
-                            .latest_features
-                            .map(|(_, timestamp_ms)| timestamp_ms)
-                            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
+            }
+            if let Some(estimate) = event.estimate {
+                if estimate.state == TrackingState::Tracking && estimate.precision_validated {
+                    if let Some(position) = estimate.filtered {
+                        self.process_gaze_sample(
+                            GazeSample {
+                                position,
+                                confidence: estimate.quality_score,
+                                timestamp_ms: estimate.timestamp_ms,
+                            },
+                            context,
+                        );
+                    }
+                } else {
+                    self.clear_overlay_target();
+                    if self.engine.safety != SafetyState::Paused {
                         let events = self.engine.update(GazeSample {
                             position: Point::default(),
                             confidence: 0.0,
-                            timestamp_ms,
+                            timestamp_ms: estimate.timestamp_ms,
                         });
                         self.process_events(events);
                     }
-                    self.status_message = tracker_status_message(status);
                 }
+            }
+        }
+        if self.latest_features.is_some_and(|(_, t)| {
+            (self.started_at.elapsed().as_millis() as u64).saturating_sub(t) > 200
+        }) {
+            self.clear_overlay_target();
+            if self.engine.safety != SafetyState::Paused {
+                let events = self.engine.update(GazeSample {
+                    position: Point::default(),
+                    confidence: 0.0,
+                    timestamp_ms: self.started_at.elapsed().as_millis() as u64,
+                });
+                self.process_events(events);
             }
         }
     }
@@ -1327,7 +1188,9 @@ impl eframe::App for EyeOsApp {
             match self.page {
                 Page::Overlay => self.toggle_tracking(),
                 Page::Calibration => {
-                    self.calibration_wizard = None;
+                    if let Some(tracker) = self.tracker.as_mut() {
+                        tracker.cancel_calibration();
+                    }
                     self.set_page(Page::Setup, context);
                 }
                 _ => self.set_page(Page::Overlay, context),
@@ -1432,23 +1295,16 @@ fn primary_screen_size() -> Point {
 /// Windows exposes the physical size reported by the primary display EDID.  Some inexpensive
 /// panels report no size; in that case use the standard 96-DPI conversion and label it only as a
 /// practical validation estimate rather than a hardware measurement.
-fn primary_pixels_per_cm() -> f64 {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Graphics::Gdi::{
-            GetDC, GetDeviceCaps, HORZRES, HORZSIZE, ReleaseDC,
-        };
-        let dc = unsafe { GetDC(std::ptr::null_mut()) };
-        if !dc.is_null() {
-            let pixels = unsafe { GetDeviceCaps(dc, HORZRES as i32) };
-            let millimetres = unsafe { GetDeviceCaps(dc, HORZSIZE as i32) };
-            let _ = unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
-            if pixels > 0 && millimetres > 0 {
-                return f64::from(pixels) / (f64::from(millimetres) / 10.0);
-            }
-        }
+fn tracking_config(screen_size: Point, config: &AppConfig) -> TrackerConfig {
+    TrackerConfig {
+        screen_size,
+        screen_width_mm: config.screen_width_mm,
+        screen_height_mm: config.screen_height_mm,
+        viewing_distance_mm: config.viewing_distance_mm,
+        camera_id: format!("webcam:{}", config.camera_index),
+        display_id: format!("primary:{}x{}", screen_size.x, screen_size.y),
+        ..TrackerConfig::default()
     }
-    96.0 / 2.54
 }
 
 fn physical_cursor_position() -> Option<Point> {
@@ -1525,78 +1381,5 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("EyeOS could not start: {error:#}");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn calibration_wizard_requires_distinct_positions_and_passes_validation() {
-        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0), 37.795);
-        let mut timestamp_ms = 0_u64;
-        for _ in 0..25 {
-            let target = wizard.target().expect("calibration target");
-            let features = EyeFeatures {
-                x: target.x / 1_920.0,
-                y: target.y / 1_080.0,
-                confidence: 1.0,
-                one_eye_fallback: false,
-                blink: false,
-            };
-            assert!(wizard.observe(features, timestamp_ms).is_none());
-            timestamp_ms += 1_000;
-            for _ in 0..CALIBRATION_SAMPLES_PER_TARGET {
-                assert!(wizard.observe(features, timestamp_ms).is_none());
-                timestamp_ms += 33;
-            }
-        }
-        let mut completed = None;
-        for _ in 0..5 {
-            let target = wizard.target().expect("validation target");
-            let features = EyeFeatures {
-                x: target.x / 1_920.0,
-                y: target.y / 1_080.0,
-                confidence: 1.0,
-                one_eye_fallback: false,
-                blink: false,
-            };
-            assert!(wizard.observe(features, timestamp_ms).is_none());
-            timestamp_ms += 1_000;
-            for _ in 0..CALIBRATION_SAMPLES_PER_TARGET {
-                completed = wizard.observe(features, timestamp_ms);
-                timestamp_ms += 33;
-            }
-        }
-        let CalibrationOutcome::Completed { profile, .. } = completed.expect("completed profile")
-        else {
-            panic!("synthetic calibration should pass validation")
-        };
-        assert_eq!(profile.sample_count, 25);
-        assert!(profile.validation_passed);
-    }
-
-    #[test]
-    fn calibration_wizard_rejects_a_stationary_gaze() {
-        let mut wizard = CalibrationWizard::new(Point::new(1_920.0, 1_080.0), 37.795);
-        let features = EyeFeatures {
-            x: 0.5,
-            y: 0.5,
-            confidence: 1.0,
-            one_eye_fallback: false,
-            blink: false,
-        };
-        let mut timestamp_ms = 0_u64;
-        let mut outcome = None;
-        for _ in 0..25 {
-            assert!(wizard.observe(features, timestamp_ms).is_none());
-            timestamp_ms += 1_000;
-            for _ in 0..CALIBRATION_SAMPLES_PER_TARGET {
-                outcome = wizard.observe(features, timestamp_ms);
-                timestamp_ms += 33;
-            }
-        }
-        assert!(matches!(outcome, Some(CalibrationOutcome::Rejected(_))));
     }
 }

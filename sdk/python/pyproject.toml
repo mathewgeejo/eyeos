@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eyeos-tracker"
+version = "0.2.0"
+description = "Local modular webcam gaze tracking through EyeOS's native C ABI"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+
+[project.optional-dependencies]
+examples = ["opencv-python>=4.8"]
+
+[tool.setuptools]
+py-modules = ["eye_tracker"]

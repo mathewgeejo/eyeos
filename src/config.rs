@@ -14,6 +14,12 @@ pub struct AppConfig {
     pub start_dry_run: bool,
     pub live_input_confirmed: bool,
     pub phrase_cards: Vec<String>,
+    #[serde(default)]
+    pub screen_width_mm: Option<f64>,
+    #[serde(default)]
+    pub screen_height_mm: Option<f64>,
+    #[serde(default)]
+    pub viewing_distance_mm: Option<f64>,
 }
 
 impl Default for AppConfig {
@@ -32,6 +38,9 @@ impl Default for AppConfig {
                 "Please give me a moment.".to_owned(),
                 "Thank you.".to_owned(),
             ],
+            screen_width_mm: None,
+            screen_height_mm: None,
+            viewing_distance_mm: None,
         }
     }
 }

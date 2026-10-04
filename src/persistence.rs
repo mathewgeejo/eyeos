@@ -60,11 +60,27 @@ impl ProfileStore {
         }
         let protected = fs::read(&path).context("reading encrypted calibration profile")?;
         let raw = dpapi::unprotect(&protected)?;
-        let profile = serde_json::from_slice(&raw).context("reading calibration profile")?;
+        // Legacy profiles lack rich features and corrected preprocessing; do not
+        // carry their validation flag into the new engine.
+        let value: serde_json::Value =
+            serde_json::from_slice(&raw).context("reading calibration profile")?;
+        if value.get("version").and_then(|v| v.as_u64())
+            != Some(eye_tracker_core::PROFILE_VERSION as u64)
+        {
+            return Ok(None);
+        }
+        let profile: CalibrationProfile =
+            serde_json::from_value(value).context("reading calibration profile")?;
+        profile
+            .validate(&profile.config)
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(Some(profile))
     }
 
     pub fn save_calibration(&self, calibration: &CalibrationProfile) -> Result<()> {
+        calibration
+            .validate(&calibration.config)
+            .map_err(|e| anyhow::anyhow!(e))?;
         fs::create_dir_all(&self.root)
             .with_context(|| format!("creating {}", self.root.display()))?;
         let raw = serde_json::to_vec(calibration).context("serializing calibration profile")?;
@@ -256,15 +272,25 @@ mod tests {
     fn calibration_is_protected_and_round_trips() {
         let directory = tempfile::tempdir().unwrap();
         let store = ProfileStore::at(directory.path().to_path_buf());
-        let profile = CalibrationProfile {
-            x_coefficients: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            y_coefficients: [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
-            sample_count: 25,
-            median_error_px: 1.5,
-            validation_median_error_px: 2.0,
-            validation_median_error_cm: 0.05,
-            validation_passed: true,
-        };
+        let mut samples = Vec::new();
+        for y in [0.1, 0.5, 0.9] {
+            for x in [0.1, 0.5, 0.9] {
+                samples.push(eye_tracker_core::Fixation {
+                    group_id: samples.len() as u64,
+                    observation: eye_tracker_core::Observation {
+                        x,
+                        y,
+                        confidence: 1.0,
+                        ..eye_tracker_core::Observation::default()
+                    },
+                    target: eye_tracker_core::Point::new(x * 1920.0, y * 1080.0),
+                    frames: 12,
+                });
+            }
+        }
+        let profile =
+            CalibrationProfile::fit_fixations(eye_tracker_core::TrackerConfig::default(), samples)
+                .unwrap();
         store.save_calibration(&profile).unwrap();
         assert_eq!(store.load_calibration().unwrap(), Some(profile));
     }

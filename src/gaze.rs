@@ -2,28 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::input::InputAction;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-}
-
-impl Point {
-    pub const fn new(x: f64, y: f64) -> Self {
-        Self { x, y }
-    }
-
-    pub fn distance_to(self, other: Self) -> f64 {
-        (self.x - other.x).hypot(self.y - other.y)
-    }
-
-    fn lerp(self, target: Self, alpha: f64) -> Self {
-        Self::new(
-            self.x + (target.x - self.x) * alpha,
-            self.y + (target.y - self.y) * alpha,
-        )
-    }
-}
+pub use eye_tracker_core::Point;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GazeSample {
@@ -130,7 +109,10 @@ impl ControlEngine {
     }
 
     pub fn update(&mut self, sample: GazeSample) -> Vec<EngineEvent> {
-        if sample.confidence < self.minimum_confidence {
+        if !sample.confidence.is_finite()
+            || !sample.position.finite()
+            || sample.confidence < self.minimum_confidence
+        {
             return self.lose_tracking();
         }
 
@@ -147,10 +129,8 @@ impl ControlEngine {
             sample.position.x.clamp(0.0, self.screen_size.x),
             sample.position.y.clamp(0.0, self.screen_size.y),
         );
-        let smooth = self
-            .smoothed
-            .map(|previous| previous.lerp(target, 0.35))
-            .unwrap_or(target);
+        // The SDK filters once; overlays and desktop input use the same point.
+        let smooth = target;
         self.smoothed = Some(smooth);
 
         let mut events = Vec::new();
@@ -231,6 +211,7 @@ impl ControlEngine {
     }
 
     fn lose_tracking(&mut self) -> Vec<EngineEvent> {
+        self.smoothed = None;
         let mut events = Vec::new();
         if self.drag_is_held {
             self.drag_is_held = false;

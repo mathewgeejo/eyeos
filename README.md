@@ -14,8 +14,19 @@ and a clickable control blob share this screen. Monitor EDID supplies physical
 display size when available; viewing distance is entered by the user. After
 calibration, the optional floating desktop mode opens a small transparent control
 blob in the bottom-left corner.
-There is no startup dashboard or menu. With a valid local tracker and independently validated calibration, it
-starts tracking immediately. An 800 ms dwell on the blob opens the compact 3×3 action pad;
+The workspace has explicit **Mouse movement**, **Keyboard input**, **Use on desktop**,
+and **Pause input** buttons. The keyboard preview is available before calibration;
+typing there stays in EyeOS. It includes numbers, letters, space, delete, enter,
+and phrase shortcuts, with visible gaze dwell progress on each key.
+
+After precision validation, enable live mouse and keyboard input. Select mouse
+movement or the keyboard, then choose **Use on desktop** to access other apps.
+For desktop typing, click the destination text field once; the floating keyboard
+does not take focus when you click or dwell on its keys. Mouse movement includes
+dwell clicking. Escape in the workspace pauses input.
+
+With a validated saved profile and live input enabled, tracking can resume on launch.
+An 800 ms dwell on the blob opens the compact 3×3 action pad;
 choosing an action returns to the blob. The gaze keyboard is also a compact bottom overlay and
 supports direct dwell selection, without requiring a mouse click.
 
@@ -58,7 +69,7 @@ eyeos.exe --reset-profile
 ```
 
 First-time setup: run `eyeos.exe --setup`, enter actual screen dimensions and eye-to-screen
-distance, then start quick personalized calibration. Nine targets and three head-position
+distance, then choose **Start full calibration**. Nine targets and three head-position
 fixations are followed by thirteen separate validation targets. EyeOS reports raw median/p95
 pixel error, estimated angular error, coverage, jitter and latency. Fine desktop input requires
 independent precision validation (median <=1 degree, p95 <=2 degrees); targeted extra calibration

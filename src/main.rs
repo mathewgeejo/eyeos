@@ -17,7 +17,7 @@ use eyeos::{
 const BLOB_SIZE: f32 = 80.0;
 const PANEL_SIZE: f32 = 300.0;
 const KEYBOARD_WIDTH: f32 = 720.0;
-const KEYBOARD_HEIGHT: f32 = 340.0;
+const KEYBOARD_HEIGHT: f32 = 432.0;
 const OVERLAY_MARGIN: f32 = 16.0;
 
 #[derive(Debug, Parser)]
@@ -43,8 +43,7 @@ struct Cli {
     simulate_gaze: bool,
 }
 
-/// The normal launch surface is deliberately only the blob. Full-sized screens are available
-/// only for caregiver setup/training or after an intentional gaze dwell on the blob.
+/// Setup combines calibration, gaze feedback and controls. Desktop input uses compact overlays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overlay,
@@ -106,6 +105,11 @@ struct EyeOsApp {
     overlay_cooldown_until: u64,
     detected_display: Option<DisplayGeometry>,
     gaze_preview: Option<Point>,
+    workspace_keyboard: bool,
+    keyboard_preview: String,
+    keyboard_targets: Vec<(Rect, KeyboardAction)>,
+    viewport_origin: Pos2,
+    ui_scale: f32,
 }
 
 impl EyeOsApp {
@@ -160,6 +164,11 @@ impl EyeOsApp {
             overlay_cooldown_until: 0,
             detected_display,
             gaze_preview: None,
+            workspace_keyboard: false,
+            keyboard_preview: String::new(),
+            keyboard_targets: Vec::new(),
+            viewport_origin: Pos2::ZERO,
+            ui_scale: 1.0,
         };
 
         // A user who has a reviewed local model and a saved calibration should not need a
@@ -251,6 +260,8 @@ impl EyeOsApp {
     fn set_page(&mut self, page: Page, context: &egui::Context) {
         self.page = page;
         self.clear_overlay_target();
+        self.keyboard_targets.clear();
+        set_keyboard_no_activate(page == Page::Keyboard);
         let fullscreen = matches!(page, Page::Setup | Page::Calibration);
         context.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         context.send_viewport_cmd(egui::ViewportCommand::Transparent(!fullscreen));
@@ -378,8 +389,20 @@ impl EyeOsApp {
                 }
             }
             Page::Setup => {
-                let events = self.engine.update(sample);
-                self.process_events(events);
+                if self.workspace_keyboard {
+                    if let Some(action) = self.keyboard_action_at(sample.position) {
+                        self.update_overlay_target(
+                            OverlayTarget::Key(action),
+                            sample.timestamp_ms,
+                            context,
+                        );
+                    } else {
+                        self.clear_overlay_target();
+                    }
+                } else {
+                    let events = self.engine.update(sample);
+                    self.process_events(events);
+                }
             }
             Page::Calibration | Page::Training => {}
         }
@@ -428,6 +451,105 @@ impl EyeOsApp {
         self.dwell_progress = 0.0;
     }
 
+    fn pause_input(&mut self) {
+        // Release a live held button before switching to the dry-run backend.
+        let events = self.engine.set_paused(true);
+        self.process_events(events);
+        self.input.set_dry_run(true);
+        self.clear_overlay_target();
+    }
+
+    fn start_workspace_input(&mut self, mode: InteractionMode) {
+        if !self.has_validated_calibration() || !self.config.live_input_confirmed {
+            return;
+        }
+        self.pause_input();
+        self.input.set_dry_run(self.simulate_gaze);
+        self.engine.set_mode(mode);
+        let events = self.engine.set_paused(false);
+        self.process_events(events);
+    }
+
+    fn render_workspace_controls(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        ui.label(
+            RichText::new("CONTROLS")
+                .small()
+                .color(Color32::from_rgb(127, 163, 183)),
+        );
+        let validated = self.has_validated_calibration();
+        let enabled = validated && self.config.live_input_confirmed;
+        ui.label(
+            RichText::new(
+                if self.engine.safety == SafetyState::Tracking && !self.input.is_dry_run() {
+                    format!("Live input: {}", mode_label(self.engine.mode))
+                } else {
+                    "Desktop input paused".into()
+                },
+            )
+            .color(Color32::from_rgb(115, 238, 209)),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new("Mouse movement").min_size(Vec2::new(155.0, 42.0)),
+                )
+                .clicked()
+            {
+                self.workspace_keyboard = false;
+                self.start_workspace_input(InteractionMode::Pointer);
+            }
+            if ui
+                .add(
+                    egui::Button::new("Keyboard input")
+                        .selected(self.workspace_keyboard)
+                        .min_size(Vec2::new(155.0, 42.0)),
+                )
+                .clicked()
+            {
+                self.pause_input();
+                self.workspace_keyboard = !self.workspace_keyboard;
+                self.keyboard_targets.clear();
+            }
+        });
+        ui.add_enabled_ui(validated, |ui| {
+            if ui
+                .checkbox(
+                    &mut self.config.live_input_confirmed,
+                    "Enable live mouse and keyboard input",
+                )
+                .changed()
+            {
+                if !self.config.live_input_confirmed {
+                    self.pause_input();
+                }
+                self.save_config();
+            }
+        });
+        if !validated {
+            ui.label("Keyboard preview is available now. Desktop input unlocks after precision validation.");
+        } else {
+            ui.label(if self.workspace_keyboard {
+                "Type in the preview, or open the desktop keyboard for another app."
+            } else {
+                "Mouse movement includes dwell clicking. Use the desktop overlay to reach other apps."
+            });
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(enabled, egui::Button::new("Use on desktop").min_size(Vec2::new(155.0, 36.0))).clicked() {
+                let keyboard = self.workspace_keyboard;
+                self.start_workspace_input(if keyboard { InteractionMode::Keyboard } else { InteractionMode::Pointer });
+                self.set_page(if keyboard { Page::Keyboard } else { Page::Overlay }, context);
+                if keyboard { self.status_message = "Click a text field in your app, then look at the keyboard keys. Dwell types; CLOSE returns to the desktop blob.".into(); }
+            }
+            if ui.add(egui::Button::new("Pause input").min_size(Vec2::new(155.0, 36.0))).clicked() {
+                self.pause_input();
+            }
+        });
+        ui.add_space(8.0);
+        ui.separator();
+    }
+
     fn activate_action(&mut self, action: OverlayAction, context: &egui::Context) {
         match action {
             OverlayAction::LeftClick => self.select_mode(InteractionMode::Pointer),
@@ -459,6 +581,33 @@ impl EyeOsApp {
     }
 
     fn activate_keyboard_action(&mut self, action: KeyboardAction, context: &egui::Context) {
+        if self.page == Page::Setup {
+            match action {
+                KeyboardAction::Text(text) => self.keyboard_preview.push_str(text),
+                KeyboardAction::Backspace => {
+                    self.keyboard_preview.pop();
+                }
+                KeyboardAction::Enter => self.keyboard_preview.push('\n'),
+                KeyboardAction::Phrase(index) => {
+                    if let Some(text) = self.config.phrase_cards.get(index) {
+                        self.keyboard_preview.push_str(text);
+                    }
+                }
+                KeyboardAction::Back => {
+                    self.workspace_keyboard = false;
+                    self.clear_overlay_target();
+                }
+            }
+            return;
+        }
+        if action != KeyboardAction::Back
+            && (self.engine.safety != SafetyState::Tracking
+                || (!self.simulate_gaze && !self.has_validated_calibration()))
+        {
+            self.status_message =
+                "Desktop typing is paused. Resume validated tracking first.".into();
+            return;
+        }
         match action {
             KeyboardAction::Text(value) => self.dispatch(InputAction::Text(value.to_owned())),
             KeyboardAction::Backspace => self.dispatch(InputAction::KeyChord {
@@ -467,7 +616,12 @@ impl EyeOsApp {
                 alt: false,
                 virtual_key: 0x08,
             }),
-            KeyboardAction::Enter => self.dispatch(InputAction::Text("\n".to_owned())),
+            KeyboardAction::Enter => self.dispatch(InputAction::KeyChord {
+                ctrl: false,
+                shift: false,
+                alt: false,
+                virtual_key: 0x0D,
+            }),
             KeyboardAction::Phrase(index) => {
                 if let Some(phrase) = self.config.phrase_cards.get(index) {
                     self.dispatch(InputAction::Text(phrase.clone()));
@@ -481,20 +635,19 @@ impl EyeOsApp {
     }
 
     fn in_blob(&self, point: Point) -> bool {
-        let origin = self.overlay_origin(BLOB_SIZE);
-        let center = Point::new(
-            origin.x + f64::from(BLOB_SIZE / 2.0),
-            origin.y + f64::from(BLOB_SIZE / 2.0),
-        );
-        point.distance_to(center) <= f64::from(BLOB_SIZE * 0.45)
+        local_gaze_point(point, self.ui_scale, self.viewport_origin).is_some_and(|point| {
+            point.distance(Pos2::new(BLOB_SIZE / 2.0, BLOB_SIZE / 2.0)) <= BLOB_SIZE * 0.45
+        })
     }
 
     fn action_at(&self, point: Point) -> Option<OverlayAction> {
-        let origin = self.overlay_origin(PANEL_SIZE);
-        let local_x = point.x - origin.x;
-        let local_y = point.y - origin.y;
-        if !(0.0..f64::from(PANEL_SIZE)).contains(&local_x)
-            || !(0.0..f64::from(PANEL_SIZE)).contains(&local_y)
+        let point = local_gaze_point(point, self.ui_scale, self.viewport_origin)?;
+        let local_x = point.x;
+        let local_y = point.y;
+        if !(0.0..PANEL_SIZE).contains(&local_x)
+            || !(0.0..PANEL_SIZE).contains(&local_y)
+            || !(4.0..=96.0).contains(&(local_x % 100.0))
+            || !(4.0..=96.0).contains(&(local_y % 100.0))
         {
             return None;
         }
@@ -504,59 +657,11 @@ impl EyeOsApp {
     }
 
     fn keyboard_action_at(&self, point: Point) -> Option<KeyboardAction> {
-        let origin = self.overlay_origin(KEYBOARD_HEIGHT);
-        let x = point.x - origin.x;
-        let y = point.y - origin.y;
-        if !(0.0..f64::from(KEYBOARD_WIDTH)).contains(&x)
-            || !(0.0..f64::from(KEYBOARD_HEIGHT)).contains(&y)
-        {
-            return None;
-        }
-
-        if y < 60.0 {
-            return KEY_ROWS[0]
-                .get((x / 72.0) as usize)
-                .map(|key| KeyboardAction::Text(key));
-        }
-        if y < 120.0 {
-            return KEY_ROWS[1]
-                .get((x / 72.0) as usize)
-                .map(|key| KeyboardAction::Text(key));
-        }
-        if y < 180.0 {
-            return KEY_ROWS[2]
-                .get((x / 72.0) as usize)
-                .map(|key| KeyboardAction::Text(key));
-        }
-        if y < 260.0 {
-            return if x < 216.0 {
-                Some(KeyboardAction::Text(" "))
-            } else if x < 360.0 {
-                Some(KeyboardAction::Backspace)
-            } else if x < 504.0 {
-                Some(KeyboardAction::Enter)
-            } else {
-                Some(KeyboardAction::Back)
-            };
-        }
-        if y < 340.0 {
-            return if x < 240.0 {
-                Some(KeyboardAction::Text("the "))
-            } else if x < 480.0 {
-                Some(KeyboardAction::Text("and "))
-            } else if self.config.phrase_cards.is_empty() {
-                Some(KeyboardAction::Text("thank you"))
-            } else {
-                Some(KeyboardAction::Phrase(0))
-            };
-        }
-        None
-    }
-
-    fn overlay_origin(&self, height: f32) -> Point {
-        Point::new(
-            f64::from(OVERLAY_MARGIN),
-            (self.screen_size.y - f64::from(height) - f64::from(OVERLAY_MARGIN)).max(0.0),
+        keyboard_hit_test(
+            point,
+            self.ui_scale,
+            self.viewport_origin,
+            &self.keyboard_targets,
         )
     }
 
@@ -635,58 +740,53 @@ impl EyeOsApp {
     }
 
     fn render_keyboard_overlay(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        for (row_index, row) in KEY_ROWS.iter().enumerate() {
+        ui.painter()
+            .rect_filled(ui.max_rect(), 12.0, Color32::from_rgb(16, 28, 41));
+        ui.painter().text(Pos2::new(12.0, 14.0), Align2::LEFT_CENTER,
+            "Click a text field in your app, then look at a key. CLOSE returns to the desktop blob.",
+            FontId::proportional(13.0), Color32::WHITE);
+        self.render_keyboard_grid(
+            ui,
+            context,
+            Rect::from_min_size(Pos2::new(0.0, 32.0), Vec2::new(KEYBOARD_WIDTH, 400.0)),
+        );
+    }
+
+    fn render_keyboard_grid(&mut self, ui: &mut egui::Ui, context: &egui::Context, bounds: Rect) {
+        self.keyboard_targets.clear();
+        let scale = bounds.width() / KEYBOARD_WIDTH;
+        let origin = bounds.min;
+        let key_rect = |x: f32, y: f32, w: f32, h: f32| {
+            Rect::from_min_size(origin + Vec2::new(x, y) * scale, Vec2::new(w, h) * scale)
+        };
+        let numbers: &[&'static str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+        for (row_index, row) in std::iter::once(numbers)
+            .chain(KEY_ROWS.iter().copied())
+            .enumerate()
+        {
             for (column, key) in row.iter().enumerate() {
-                let rect = Rect::from_min_size(
-                    Pos2::new(column as f32 * 72.0 + 3.0, row_index as f32 * 60.0 + 3.0),
-                    Vec2::new(66.0, 54.0),
+                self.keyboard_button(
+                    ui,
+                    key_rect(
+                        column as f32 * 72.0 + 3.0,
+                        row_index as f32 * 60.0 + 3.0,
+                        66.0,
+                        54.0,
+                    ),
+                    key,
+                    KeyboardAction::Text(key),
+                    context,
                 );
-                let action = KeyboardAction::Text(key);
-                self.keyboard_button(ui, rect, key, action, context);
             }
         }
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(3.0, 183.0), Vec2::new(210.0, 72.0)),
-            "SPACE",
-            KeyboardAction::Text(" "),
-            context,
-        );
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(219.0, 183.0), Vec2::new(138.0, 72.0)),
-            "BACK",
-            KeyboardAction::Backspace,
-            context,
-        );
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(363.0, 183.0), Vec2::new(138.0, 72.0)),
-            "ENTER",
-            KeyboardAction::Enter,
-            context,
-        );
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(507.0, 183.0), Vec2::new(210.0, 72.0)),
-            "CLOSE",
-            KeyboardAction::Back,
-            context,
-        );
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(3.0, 263.0), Vec2::new(234.0, 72.0)),
-            "the",
-            KeyboardAction::Text("the "),
-            context,
-        );
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(243.0, 263.0), Vec2::new(234.0, 72.0)),
-            "and",
-            KeyboardAction::Text("and "),
-            context,
-        );
+        for (x, width, label, action) in [
+            (3.0, 210.0, "SPACE", KeyboardAction::Text(" ")),
+            (219.0, 138.0, "DELETE", KeyboardAction::Backspace),
+            (363.0, 138.0, "ENTER", KeyboardAction::Enter),
+            (507.0, 210.0, "CLOSE", KeyboardAction::Back),
+        ] {
+            self.keyboard_button(ui, key_rect(x, 243.0, width, 72.0), label, action, context);
+        }
         let phrase = self
             .config
             .phrase_cards
@@ -698,13 +798,73 @@ impl EyeOsApp {
         } else {
             KeyboardAction::Phrase(0)
         };
-        self.keyboard_button(
-            ui,
-            Rect::from_min_size(Pos2::new(483.0, 263.0), Vec2::new(234.0, 72.0)),
-            &phrase,
-            phrase_action,
-            context,
-        );
+        for (x, label, action) in [
+            (3.0, "the", KeyboardAction::Text("the ")),
+            (243.0, "and", KeyboardAction::Text("and ")),
+            (483.0, phrase.as_str(), phrase_action),
+        ] {
+            self.keyboard_button(ui, key_rect(x, 323.0, 234.0, 72.0), label, action, context);
+        }
+    }
+
+    fn render_workspace_preview(&mut self, context: &egui::Context, bounds: Rect) {
+        egui::Area::new(egui::Id::new("workspace-preview"))
+            .fixed_pos(bounds.min)
+            .default_size(bounds.size())
+            .show(context, |ui| {
+                ui.set_width(bounds.width());
+                egui::Frame::new().fill(Color32::from_rgb(16, 28, 41))
+                    .inner_margin(24.0).corner_radius(20.0).show(ui, |ui| {
+                        ui.set_width(bounds.width() - 48.0);
+                        egui::ScrollArea::vertical().max_height(bounds.height() - 48.0).show(ui, |ui| {
+                            if self.workspace_keyboard {
+                                ui.label(RichText::new("Keyboard input").size(26.0).strong());
+                                ui.label("Practice here with the mouse, or gaze after calibration. This preview stays inside EyeOS.");
+                                ui.add_space(14.0);
+                                ui.add(egui::TextEdit::multiline(&mut self.keyboard_preview)
+                                    .hint_text("Your text appears here...").desired_rows(3)
+                                    .desired_width(f32::INFINITY));
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Gaze dwell: {} ms", self.engine.keyboard_dwell_ms));
+                                    if ui.button("Clear text").clicked() { self.keyboard_preview.clear(); }
+                                });
+                                ui.add_space(18.0);
+                                let width = ui.available_width().min(KEYBOARD_WIDTH);
+                                let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 400.0 * width / KEYBOARD_WIDTH), Sense::hover());
+                                self.render_keyboard_grid(ui, context, rect);
+                                ui.add_space(12.0);
+                                ui.label("For another app: enable live input, choose Use on desktop, then click its text field. The floating keyboard keeps that app focused.");
+                            } else {
+                                self.keyboard_targets.clear();
+                                ui.label(RichText::new("Tracking workspace").size(28.0).strong());
+                                ui.label(RichText::new("Personalized to your eyes, camera and display.")
+                                    .color(Color32::from_rgb(161, 188, 209)));
+                                ui.add_space(30.0);
+                                for (number, title, detail) in [
+                                    ("01", "Check your position", "Keep both eyes visible, with even lighting. Confirm your eye-to-screen distance on the left."),
+                                    ("02", "Calibrate and validate", "Follow 12 calibration fixations, then 13 separate validation targets. Watch the sample progress as each target is collected."),
+                                    ("03", "Choose how to interact", "Move the mouse with your gaze or open the keyboard. Desktop control becomes available when precision validation passes."),
+                                ] {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(number).size(26.0).color(Color32::from_rgb(115, 238, 209)));
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(title).size(18.0).strong());
+                                            ui.label(detail);
+                                        });
+                                    });
+                                    ui.add_space(24.0);
+                                }
+                                ui.separator();
+                                ui.label(RichText::new("LIVE GAZE PREVIEW").small().color(Color32::from_rgb(127, 163, 183)));
+                                ui.label(if self.gaze_preview.is_some() {
+                                    "The amber ring follows the same filtered gaze used for desktop control."
+                                } else { "After calibration, an amber ring will show where the tracker estimates you are looking." });
+                                ui.add_space(12.0);
+                                ui.label("Escape pauses input. All inference and calibration stay on this computer.");
+                            }
+                        });
+                    });
+            });
     }
 
     fn keyboard_button(
@@ -715,6 +875,8 @@ impl EyeOsApp {
         action: KeyboardAction,
         context: &egui::Context,
     ) {
+        self.keyboard_targets
+            .push((rect.intersect(ui.clip_rect()), action.clone()));
         let response = ui.allocate_rect(rect, Sense::click());
         let selected = self.overlay_target == Some(OverlayTarget::Key(action.clone()));
         ui.painter().rect_filled(
@@ -743,9 +905,17 @@ impl EyeOsApp {
             rect.center(),
             Align2::CENTER_CENTER,
             label,
-            FontId::proportional(18.0),
+            FontId::proportional((rect.width() * 0.27).clamp(11.0, 18.0)),
             Color32::WHITE,
         );
+        if selected && self.dwell_progress > 0.0 {
+            let bar = Rect::from_min_size(
+                Pos2::new(rect.left() + 4.0, rect.bottom() - 7.0),
+                Vec2::new((rect.width() - 8.0) * self.dwell_progress, 3.0),
+            );
+            ui.painter()
+                .rect_filled(bar, 2.0, Color32::from_rgb(115, 238, 209));
+        }
         if response.clicked() {
             self.activate_keyboard_action(action, context);
         }
@@ -808,7 +978,15 @@ impl EyeOsApp {
     }
 
     fn render_setup(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        ui.heading("EyeOS tracking workspace");
+        ui.label(
+            RichText::new("EyeOS")
+                .size(30.0)
+                .strong()
+                .color(Color32::from_rgb(115, 238, 209)),
+        );
+        ui.label(
+            RichText::new("Your eyes. Your workspace.").color(Color32::from_rgb(168, 189, 207)),
+        );
         ui.horizontal(|ui| {
             let (rect, response) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::click());
             let colour = match self.engine.safety {
@@ -872,6 +1050,13 @@ impl EyeOsApp {
             }
             return;
         }
+        ui.add_space(10.0);
+        self.render_workspace_controls(ui, context);
+        ui.label(
+            RichText::new("PERSONALIZED CALIBRATION")
+                .small()
+                .color(Color32::from_rgb(127, 163, 183)),
+        );
         ui.add_space(6.0);
         ui.label("Place the camera at eye height with even lighting. Calibration must be completed by the intended user.");
         match &self.camera {
@@ -925,6 +1110,9 @@ impl EyeOsApp {
         } else {
             ui.label("A fresh calibration is required for the new tracking engine.");
         }
+        egui::CollapsingHeader::new("Display size and viewing distance")
+            .default_open(self.config.viewing_distance_mm.is_none())
+            .show(ui, |ui| {
         ui.label(format!(
             "Display: {:.0} × {:.0} pixels",
             self.screen_size.x, self.screen_size.y
@@ -992,6 +1180,7 @@ impl EyeOsApp {
             self.process_events(events);
             self.save_config();
         }
+            });
         let ready = self.model == ModelStatus::Ready
             && self.tracker.as_ref().is_some_and(|t| t.has_camera())
             && self.has_recent_eye_features();
@@ -1004,7 +1193,9 @@ impl EyeOsApp {
         if ui
             .add_enabled(
                 ready,
-                egui::Button::new("Start quick personalized calibration"),
+                egui::Button::new("Start full calibration")
+                    .fill(Color32::from_rgb(33, 116, 103))
+                    .min_size(Vec2::new(ui.available_width(), 42.0)),
             )
             .clicked()
         {
@@ -1032,7 +1223,8 @@ impl EyeOsApp {
                     "Add targeted calibration and revalidate"
                 } else {
                     "Resume remaining calibration"
-                }),
+                })
+                .min_size(Vec2::new(ui.available_width(), 36.0)),
             )
             .clicked()
         {
@@ -1049,41 +1241,6 @@ impl EyeOsApp {
         }
         if !extra {
             ui.label("Targeted calibration becomes available after initial calibration or an interrupted fixation.");
-        }
-        if self.has_validated_calibration() {
-            ui.separator();
-            if ui
-                .checkbox(
-                    &mut self.config.live_input_confirmed,
-                    "Enable live desktop mouse control",
-                )
-                .changed()
-            {
-                if !self.config.live_input_confirmed {
-                    self.input.set_dry_run(true);
-                    let events = self.engine.set_paused(true);
-                    self.process_events(events);
-                }
-                self.save_config();
-            }
-            if ui
-                .button(if self.engine.safety == SafetyState::Tracking {
-                    "Pause mouse control"
-                } else {
-                    "Start mouse control here"
-                })
-                .clicked()
-            {
-                if self.config.live_input_confirmed && self.engine.safety != SafetyState::Tracking {
-                    self.input.set_dry_run(false);
-                    let events = self.engine.set_paused(false);
-                    self.process_events(events);
-                } else {
-                    let events = self.engine.set_paused(true);
-                    self.process_events(events);
-                    self.input.set_dry_run(true);
-                }
-            }
         }
         if ui.button("Re-check camera").clicked() {
             self.camera = detect_camera_status();
@@ -1114,15 +1271,18 @@ impl EyeOsApp {
             ui.painter()
                 .circle_stroke(p, 32.0, Stroke::new(3.0_f32, Color32::WHITE));
         }
-        if let Some(gaze) = self.gaze_preview {
-            let gaze = physical_to_logical(gaze, context.pixels_per_point());
-            ui.painter().circle_stroke(
-                Pos2::new(gaze.x as f32, gaze.y as f32),
-                10.0,
-                Stroke::new(2.0_f32, Color32::from_rgb(255, 190, 80)),
-            );
-        }
         let width = 400.0_f32.min(rect.width() * 0.45);
+        if target.is_none() {
+            self.render_workspace_preview(
+                context,
+                Rect::from_min_max(
+                    Pos2::new(rect.left() + width + 32.0, rect.top() + 24.0),
+                    Pos2::new(rect.right() - 24.0, rect.bottom() - 24.0),
+                ),
+            );
+        } else {
+            self.keyboard_targets.clear();
+        }
         // Controls stay opposite the target; center and edge targets remain visible.
         let x = if target.is_some_and(|p| p.x < self.screen_size.x * 0.5) {
             rect.right() - width - 12.0
@@ -1156,6 +1316,20 @@ impl EyeOsApp {
                             });
                     });
             });
+        // Paint above the cards without taking pointer input from their controls.
+        if let Some(gaze) = self.gaze_preview {
+            let gaze = physical_to_logical(gaze, context.pixels_per_point());
+            context
+                .layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip,
+                    egui::Id::new("live-gaze-ring"),
+                ))
+                .circle_stroke(
+                    Pos2::new(gaze.x as f32, gaze.y as f32),
+                    10.0,
+                    Stroke::new(2.0_f32, Color32::from_rgb(255, 190, 80)),
+                );
+        }
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
@@ -1171,29 +1345,7 @@ impl EyeOsApp {
         ui.checkbox(&mut self.config.high_contrast, "High contrast");
         ui.checkbox(&mut self.config.sound_feedback, "Audio feedback");
         ui.separator();
-        ui.label(RichText::new("Live desktop input").strong());
-        let model_ready = self.model == ModelStatus::Ready && self.has_validated_calibration();
-        ui.add_enabled_ui(model_ready, |ui| {
-            ui.checkbox(
-                &mut self.config.live_input_confirmed,
-                "Caregiver confirms training is complete",
-            );
-            if ui.button("Enable live input").clicked() && self.config.live_input_confirmed {
-                self.input.set_dry_run(false);
-                let events = self.engine.set_paused(false);
-                self.process_events(events);
-            }
-        });
-        if self.input.is_dry_run() {
-            ui.colored_label(
-                Color32::LIGHT_GREEN,
-                "Dry-run is active — no other application receives input.",
-            );
-        } else if ui.button("Return to dry-run now").clicked() {
-            self.input.set_dry_run(true);
-            let events = self.engine.set_paused(true);
-            self.process_events(events);
-        }
+        ui.label("Mouse and keyboard input are managed by the workspace controls above.");
         if ui.button("Save settings").clicked() {
             self.save_config();
         }
@@ -1326,6 +1478,14 @@ impl EyeOsApp {
 impl eframe::App for EyeOsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(Duration::from_millis(16));
+        self.ui_scale = context.pixels_per_point();
+        self.viewport_origin = context.input(|input| {
+            input
+                .viewport()
+                .outer_rect
+                .map(|rect| rect.min)
+                .unwrap_or(Pos2::ZERO)
+        });
         self.poll_tracker(context);
         self.maybe_run_cursor_simulator(context);
         if self.config.high_contrast {
@@ -1369,6 +1529,15 @@ impl eframe::App for EyeOsApp {
         if context.input(|input| input.key_pressed(egui::Key::Escape)) {
             match self.page {
                 Page::Overlay => self.toggle_tracking(),
+                Page::Setup => {
+                    self.pause_input();
+                    self.workspace_keyboard = false;
+                    self.keyboard_targets.clear();
+                }
+                Page::Keyboard => {
+                    self.pause_input();
+                    self.set_page(Page::Setup, context);
+                }
                 Page::Calibration => {
                     if let Some(tracker) = self.tracker.as_mut() {
                         tracker.cancel_calibration();
@@ -1404,6 +1573,232 @@ const KEY_ROWS: [&[&str]; 3] = [
     &["a", "s", "d", "f", "g", "h", "j", "k", "l"],
     &["z", "x", "c", "v", "b", "n", "m"],
 ];
+
+fn keyboard_hit_test(
+    physical: Point,
+    scale: f32,
+    viewport_origin: Pos2,
+    targets: &[(Rect, KeyboardAction)],
+) -> Option<KeyboardAction> {
+    let local = local_gaze_point(physical, scale, viewport_origin)?;
+    targets
+        .iter()
+        .find(|(rect, _)| rect.is_positive() && rect.contains(local))
+        .map(|(_, action)| action.clone())
+}
+
+fn local_gaze_point(physical: Point, scale: f32, viewport_origin: Pos2) -> Option<Pos2> {
+    if !physical.finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let logical = physical_to_logical(physical, scale);
+    Some(Pos2::new(logical.x as f32, logical.y as f32) - viewport_origin.to_vec2())
+}
+
+/// A desktop keyboard must leave the destination application focused, including
+/// when a caregiver clicks a key instead of dwelling on it.
+fn set_keyboard_no_activate(enabled: bool) {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId,
+            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+            SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
+        };
+        let title: Vec<u16> = "EyeOS\0".encode_utf16().collect();
+        let window = FindWindowW(std::ptr::null(), title.as_ptr());
+        if window.is_null() {
+            return;
+        }
+        let mut process = 0;
+        GetWindowThreadProcessId(window, &mut process);
+        if process != std::process::id() {
+            return;
+        }
+        let old = GetWindowLongPtrW(window, GWL_EXSTYLE);
+        let flag = WS_EX_NOACTIVATE as isize;
+        let new = if enabled { old | flag } else { old & !flag };
+        SetWindowLongPtrW(window, GWL_EXSTYLE, new);
+        SetWindowPos(
+            window,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = enabled;
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    fn preview_app() -> EyeOsApp {
+        EyeOsApp {
+            store: ProfileStore::at(std::env::temp_dir().join("eyeos-ui-test-unused")),
+            config: AppConfig {
+                viewing_distance_mm: Some(600.0),
+                ..Default::default()
+            },
+            engine: ControlEngine::new(1920.0, 1080.0),
+            input: InputController::default(),
+            page: Page::Setup,
+            camera: CameraStatus::NotStarted,
+            model: ModelStatus::Ready,
+            screen_size: Point::new(1920.0, 1080.0),
+            started_at: Instant::now(),
+            simulate_gaze: false,
+            training_text: String::new(),
+            status_message: "Preview only".into(),
+            dwell_progress: 0.0,
+            calibration: None,
+            tracker: None,
+            latest_features: None,
+            overlay_target: None,
+            overlay_target_started_at: None,
+            overlay_cooldown_until: 0,
+            detected_display: None,
+            gaze_preview: None,
+            workspace_keyboard: true,
+            keyboard_preview: String::new(),
+            keyboard_targets: Vec::new(),
+            viewport_origin: Pos2::ZERO,
+            ui_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn workspace_typing_stays_local_and_unvalidated_desktop_typing_is_blocked() {
+        let mut app = preview_app();
+        let context = egui::Context::default();
+        app.activate_keyboard_action(KeyboardAction::Text("hello"), &context);
+        app.activate_keyboard_action(KeyboardAction::Backspace, &context);
+        app.activate_keyboard_action(KeyboardAction::Enter, &context);
+        assert_eq!(app.keyboard_preview, "hell\n");
+        assert!(app.input.take_dry_run_events().is_empty());
+        app.page = Page::Keyboard;
+        let _ = app.engine.set_paused(false);
+        app.activate_keyboard_action(KeyboardAction::Text("do not send"), &context);
+        assert!(app.input.take_dry_run_events().is_empty());
+    }
+
+    #[test]
+    fn workspace_keyboard_renders_selectable_keys_at_normal_display_scales() {
+        for scale in [1.0, 1.25] {
+            let mut app = preview_app();
+            let context = egui::Context::default();
+            context.set_pixels_per_point(scale);
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(1920.0 / scale, 1080.0 / scale),
+                    )),
+                    ..Default::default()
+                };
+                let _ = context.run(input, |context| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(context, |ui| {
+                            app.render_workspace(ui, context);
+                        });
+                });
+            }
+            assert_eq!(app.keyboard_targets.len(), 43);
+            for (rect, action) in &app.keyboard_targets {
+                assert!(
+                    rect.is_positive(),
+                    "key {action:?} is clipped at scale {scale}"
+                );
+                assert!(rect.left() > 400.0, "keyboard overlaps workspace controls");
+                let point = Point::new(
+                    f64::from(rect.center().x * scale),
+                    f64::from(rect.center().y * scale),
+                );
+                assert_eq!(
+                    keyboard_hit_test(point, scale, Pos2::ZERO, &app.keyboard_targets),
+                    Some(action.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_targets_follow_dpi_and_window_position() {
+        let targets = vec![(
+            Rect::from_min_size(Pos2::new(20.0, 60.0), Vec2::new(66.0, 54.0)),
+            KeyboardAction::Text("q"),
+        )];
+        for scale in [1.0, 1.25, 2.0] {
+            let origin = Pos2::new(16.0, 400.0);
+            let gaze = Point::new(50.0 * f64::from(scale), 480.0 * f64::from(scale));
+            assert_eq!(
+                keyboard_hit_test(gaze, scale, origin, &targets),
+                Some(KeyboardAction::Text("q"))
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_blob_and_actions_use_the_actual_scaled_window_origin() {
+        let mut app = preview_app();
+        app.ui_scale = 1.25;
+        app.viewport_origin = Pos2::new(16.0, 600.0);
+        assert!(app.in_blob(Point::new(70.0, 800.0)));
+        assert!(!app.in_blob(Point::new(500.0, 800.0)));
+        assert_eq!(
+            app.action_at(Point::new(207.5, 1062.5)),
+            Some(OverlayAction::Calibrate)
+        );
+        assert_eq!(app.action_at(Point::new(145.0, 800.0)), None);
+    }
+
+    #[test]
+    fn keyboard_gaps_and_hidden_keys_do_not_type() {
+        let targets = vec![
+            (
+                Rect::from_min_size(Pos2::new(3.0, 3.0), Vec2::new(66.0, 54.0)),
+                KeyboardAction::Text("1"),
+            ),
+            (
+                Rect::from_min_size(Pos2::new(75.0, 3.0), Vec2::new(66.0, 54.0)),
+                KeyboardAction::Text("2"),
+            ),
+            (Rect::NOTHING, KeyboardAction::Enter),
+        ];
+        assert_eq!(
+            keyboard_hit_test(Point::new(71.0, 20.0), 1.0, Pos2::ZERO, &targets),
+            None
+        );
+        assert_eq!(
+            keyboard_hit_test(Point::new(80.0, 20.0), 1.0, Pos2::ZERO, &targets),
+            Some(KeyboardAction::Text("2"))
+        );
+        assert_eq!(
+            keyboard_hit_test(Point::new(80.0, 90.0), 1.0, Pos2::ZERO, &targets),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_gaze_or_scale_cannot_select_a_key() {
+        let targets = vec![(Rect::EVERYTHING, KeyboardAction::Enter)];
+        assert_eq!(
+            keyboard_hit_test(Point::new(f64::NAN, 0.0), 1.0, Pos2::ZERO, &targets),
+            None
+        );
+        for scale in [0.0, -1.0, f32::NAN] {
+            assert_eq!(
+                keyboard_hit_test(Point::default(), scale, Pos2::ZERO, &targets),
+                None
+            );
+        }
+    }
+}
 
 fn action_label(action: OverlayAction) -> &'static str {
     match action {
@@ -1575,6 +1970,14 @@ fn run() -> Result<()> {
         "EyeOS",
         options,
         Box::new(move |context| {
+            let mut style = (*context.egui_ctx.style()).clone();
+            style.visuals = egui::Visuals::dark();
+            style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+            style.spacing.button_padding = Vec2::new(12.0, 8.0);
+            style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(30, 49, 64);
+            style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(43, 80, 91);
+            style.visuals.selection.bg_fill = Color32::from_rgb(33, 116, 103);
+            context.egui_ctx.set_style(style);
             let mut app = EyeOsApp::new(store, config, page, cli.simulate_gaze);
             app.set_page(app.page, &context.egui_ctx);
             Ok(Box::new(app))

@@ -1,0 +1,2 @@
+# Pinned model hashes describe exact upstream bytes. Windows must not rewrite XML.
+assets/models/openvino/*.xml -text

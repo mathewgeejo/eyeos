@@ -115,6 +115,9 @@ pub struct EyeTracker {
     camera: Option<LocalTracker>,
     session: Option<CalibrationSession>,
     clock: Instant,
+    last_frame_ms: Option<u64>,
+    loss_reported: bool,
+    capture_identity: Option<String>,
 }
 impl EyeTracker {
     pub fn new(config: TrackerConfig, runtime_root: PathBuf) -> Result<Self, String> {
@@ -130,10 +133,13 @@ impl EyeTracker {
             camera: None,
             session: None,
             clock: Instant::now(),
+            last_frame_ms: None,
+            loss_reported: false,
+            capture_identity: None,
         })
     }
     pub fn config(&self) -> &TrackerConfig {
-        &self.engine.config
+        self.engine.config()
     }
     pub fn timestamp_ms(&self) -> u64 {
         self.clock.elapsed().as_millis() as u64
@@ -146,6 +152,41 @@ impl EyeTracker {
     }
     pub fn engine_mut(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+    fn bind_capture(&mut self, identity: String) {
+        if self
+            .capture_identity
+            .as_ref()
+            .is_some_and(|old| old != &identity)
+        {
+            self.session = None;
+        }
+        if self
+            .engine
+            .profile()
+            .is_some_and(|p| p.capture_identity.as_ref() != Some(&identity))
+        {
+            self.engine.clear_profile();
+        }
+        self.capture_identity = Some(identity);
+    }
+    pub fn import_profile(&mut self, json: &str) -> Result<(), String> {
+        if self.session.as_ref().is_some_and(|s| s.target().is_some()) {
+            return Err("cancel calibration before importing a profile".into());
+        }
+        let profile: CalibrationProfile = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if self
+            .capture_identity
+            .as_ref()
+            .is_some_and(|id| profile.capture_identity.as_ref() != Some(id))
+        {
+            return Err(
+                "camera identity or capture dimensions changed; recalibration required".into(),
+            );
+        }
+        self.engine.set_profile(profile)?;
+        self.session = None;
+        Ok(())
     }
     pub fn reconfigure(&mut self, config: TrackerConfig) -> Result<(), String> {
         if config.model_id != MODEL_ID || config.camera_id != self.config().camera_id {
@@ -187,6 +228,7 @@ impl EyeTracker {
             self.camera = None;
         }
         self.engine.reset_filter();
+        self.last_frame_ms = None;
     }
     pub fn has_camera(&self) -> bool {
         #[cfg(all(windows, feature = "native"))]
@@ -232,14 +274,19 @@ impl EyeTracker {
     pub fn observe(&mut self, observation: Observation, now_ms: u64) -> Result<SdkEvent, String> {
         let timely = observation.timestamp_ms <= now_ms
             && now_ms - observation.timestamp_ms <= self.config().maximum_frame_age_ms;
-        let outcome = if timely {
+        if timely {
+            self.last_frame_ms = Some(observation.timestamp_ms);
+            self.loss_reported = false;
+        }
+        let mut outcome = if timely {
             self.session
                 .as_mut()
                 .and_then(|s| s.observe(observation, observation.timestamp_ms))
         } else {
             None
         };
-        if let Some(CalibrationOutcome::Completed { profile, .. }) = &outcome {
+        if let Some(CalibrationOutcome::Completed { profile, .. }) = &mut outcome {
+            profile.capture_identity = self.capture_identity.clone();
             self.engine.set_profile(profile.clone())?;
         }
         let estimate = self.engine.process(observation, now_ms);
@@ -252,13 +299,15 @@ impl EyeTracker {
         })
     }
     fn lost_event(&mut self, status: TrackerStatus) -> SdkEvent {
+        self.loss_reported = true;
         let now = self.timestamp_ms();
         let invalid = Observation {
             timestamp_ms: now,
             ..Observation::default()
         };
-        let outcome = self.session.as_mut().and_then(|s| s.observe(invalid, now));
-        if let Some(CalibrationOutcome::Completed { profile, .. }) = &outcome {
+        let mut outcome = self.session.as_mut().and_then(|s| s.observe(invalid, now));
+        if let Some(CalibrationOutcome::Completed { profile, .. }) = &mut outcome {
+            profile.capture_identity = self.capture_identity.clone();
             let _ = self.engine.set_profile(profile.clone());
         }
         SdkEvent {
@@ -281,6 +330,19 @@ impl EyeTracker {
                         result.push(self.observe(features, now)?);
                     }
                     TrackerEvent::Status(status) => {
+                        if let TrackerStatus::CameraReady {
+                            width,
+                            height,
+                            device_id,
+                            ..
+                        } = &status
+                        {
+                            self.bind_capture(format!("camera:{device_id}:{width}x{height}"));
+                        }
+                        if matches!(status, TrackerStatus::CameraReady { .. }) {
+                            self.last_frame_ms = Some(self.timestamp_ms());
+                            self.loss_reported = false;
+                        }
                         if matches!(
                             status,
                             TrackerStatus::NoFace
@@ -302,6 +364,17 @@ impl EyeTracker {
                     }
                 }
             }
+            let now = self.timestamp_ms();
+            if self.has_camera()
+                && !self.loss_reported
+                && self
+                    .last_frame_ms
+                    .is_some_and(|t| now.saturating_sub(t) > self.config().maximum_frame_age_ms)
+            {
+                result.push(self.lost_event(TrackerStatus::GazeUnavailable {
+                    detail: "camera/inference stream stalled".into(),
+                }));
+            }
             Ok(result)
         }
         #[cfg(not(all(windows, feature = "native")))]
@@ -318,6 +391,7 @@ impl EyeTracker {
                 return Err("owned camera is running; poll its events instead".into());
             }
             frame.validate()?;
+            self.bind_capture(format!("rgb:{}x{}", frame.width, frame.height));
             let timestamp = frame.timestamp_ms;
             let now = self.timestamp_ms();
             if timestamp > now || now - timestamp > self.config().maximum_frame_age_ms {

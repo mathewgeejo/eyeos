@@ -131,6 +131,8 @@ fn distance(model: &Regression, a: Observation, b: Observation) -> f64 {
 pub struct CalibrationProfile {
     pub version: u32,
     pub config: TrackerConfig,
+    #[serde(default)]
+    pub capture_identity: Option<String>,
     pub regression: Regression,
     pub fixations: Vec<Fixation>,
     pub retrieval_enabled: bool,
@@ -174,6 +176,7 @@ impl CalibrationProfile {
         let mut profile = Self {
             version: PROFILE_VERSION,
             config,
+            capture_identity: None,
             regression,
             fixations,
             retrieval_enabled: false,

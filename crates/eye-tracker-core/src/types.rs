@@ -93,8 +93,16 @@ impl Observation {
         ]
     }
     pub fn usable(self, minimum: f32) -> bool {
+        let norm = self
+            .gaze_direction
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
         self.features().iter().all(|v| v.is_finite())
             && self.gaze_direction.iter().all(|v| v.is_finite())
+            && (0.95..=1.05).contains(&norm)
+            && self.gaze_direction[2] >= 0.05
             && self.confidence.is_finite()
             && self.confidence >= minimum
             && self.confidence <= 1.0
@@ -193,8 +201,8 @@ impl Default for TrackerConfig {
 impl TrackerConfig {
     pub fn validate(&self) -> Result<(), String> {
         if !self.screen_size.finite()
-            || self.screen_size.x <= 0.0
-            || self.screen_size.y <= 0.0
+            || self.screen_size.x < 2.0
+            || self.screen_size.y < 2.0
             || !self.minimum_quality.is_finite()
             || !(0.0..=1.0).contains(&self.minimum_quality)
             || self.maximum_frame_age_ms == 0

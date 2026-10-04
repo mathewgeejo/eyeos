@@ -13,3 +13,7 @@ target/
 .idea/
 .DS_Store
 Thumbs.db
+\node_modules
+node_modules/
+__pycache__/
+dist/

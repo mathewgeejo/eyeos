@@ -787,10 +787,57 @@ mod tests {
                 [value, value, value]
             })
             .collect();
-        let feature = estimator
-            .estimate(&rgb, 640, 480, &frame)
-            .expect("both local models must run on a valid RGB frame");
-        assert!(feature.x.is_finite() && feature.y.is_finite());
-        assert!(feature.confidence > 0.0);
+        match estimator.estimate(&rgb, 640, 480, &frame) {
+            Ok(feature) => {
+                assert!(feature.x.is_finite() && feature.y.is_finite());
+                assert!(feature.confidence > 0.0);
+            }
+            // A checkerboard is not an eye. Both models have executed, but the
+            // generated direction must still pass the same physical validity gate.
+            Err(error) => assert_eq!(
+                error.to_string(),
+                "invalid or backward-facing gaze direction"
+            ),
+        }
+    }
+
+    #[test]
+    fn rotated_crops_cannot_include_pixels_outside_the_camera() {
+        let crop = Crop {
+            center_x: 50.0,
+            center_y: 50.0,
+            side: 60.0,
+            rotation_radians: 0.5,
+        };
+        assert!(validate_crop(crop, 100, 100).is_ok());
+        assert!(
+            validate_crop(
+                Crop {
+                    center_x: 10.0,
+                    ..crop
+                },
+                100,
+                100
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn eye_quality_rejects_uniform_and_clipped_images() {
+        let crop = Crop {
+            center_x: 16.0,
+            center_y: 16.0,
+            side: 16.0,
+            rotation_radians: 0.0,
+        };
+        assert_eq!(
+            eye_image_quality(&vec![128; 32 * 32 * 3], 32, 32, crop).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            eye_image_quality(&vec![255; 32 * 32 * 3], 32, 32, crop).unwrap(),
+            0.0
+        );
     }
 }

@@ -52,6 +52,7 @@ fn capture_loop(
         height: size.height_y,
         fps: camera.frame_rate(),
         format: camera.frame_format().to_string(),
+        device_id: format!("{:?}", camera.info()),
     }));
     let mut errors = 0;
     while !stopped.load(Ordering::Acquire) {

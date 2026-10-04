@@ -1,13 +1,16 @@
 use crate::*;
 
 pub struct EyeTracker {
-    pub config: TrackerConfig,
+    config: TrackerConfig,
     profile: Option<CalibrationProfile>,
     last_timestamp: Option<u64>,
     filtered: Option<Point>,
     previous_raw: Option<Point>,
 }
 impl EyeTracker {
+    pub fn config(&self) -> &TrackerConfig {
+        &self.config
+    }
     pub fn new(config: TrackerConfig) -> Result<Self, String> {
         config.validate()?;
         Ok(Self {
@@ -142,8 +145,12 @@ impl EyeTracker {
             return Err("backend/model identity differs from tracker configuration".into());
         }
         let timestamp = frame.timestamp_ms;
+        let started = std::time::Instant::now();
         match backend.infer(frame) {
-            Ok(Some(observation)) => Ok(self.process(observation, now_ms)),
+            Ok(Some(observation)) => Ok(self.process(
+                observation,
+                now_ms.saturating_add(started.elapsed().as_millis() as u64),
+            )),
             Ok(None) => Ok(self.lost(timestamp)),
             Err(error) => {
                 self.reset_filter();

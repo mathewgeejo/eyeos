@@ -1,0 +1,288 @@
+{
+  "version": 2,
+  "config": {},
+  "capture_identity": null,
+  "regression": {
+    "mean": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "scale": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "coefficients": [
+      [
+        0,
+        0
+      ],
+      [
+        1920,
+        0
+      ],
+      [
+        0,
+        1080
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ]
+  },
+  "fixations": [
+    {
+      "group_id": 0,
+      "frames": 12,
+      "target": {
+        "x": 192.0,
+        "y": 108.0
+      },
+      "observation": {
+        "x": 0.1,
+        "y": 0.1,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 1,
+      "frames": 12,
+      "target": {
+        "x": 960.0,
+        "y": 108.0
+      },
+      "observation": {
+        "x": 0.5,
+        "y": 0.1,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 2,
+      "frames": 12,
+      "target": {
+        "x": 1728.0,
+        "y": 108.0
+      },
+      "observation": {
+        "x": 0.9,
+        "y": 0.1,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 3,
+      "frames": 12,
+      "target": {
+        "x": 192.0,
+        "y": 540.0
+      },
+      "observation": {
+        "x": 0.1,
+        "y": 0.5,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 4,
+      "frames": 12,
+      "target": {
+        "x": 960.0,
+        "y": 540.0
+      },
+      "observation": {
+        "x": 0.5,
+        "y": 0.5,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 5,
+      "frames": 12,
+      "target": {
+        "x": 1728.0,
+        "y": 540.0
+      },
+      "observation": {
+        "x": 0.9,
+        "y": 0.5,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 6,
+      "frames": 12,
+      "target": {
+        "x": 192.0,
+        "y": 972.0
+      },
+      "observation": {
+        "x": 0.1,
+        "y": 0.9,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 7,
+      "frames": 12,
+      "target": {
+        "x": 960.0,
+        "y": 972.0
+      },
+      "observation": {
+        "x": 0.5,
+        "y": 0.9,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    },
+    {
+      "group_id": 8,
+      "frames": 12,
+      "target": {
+        "x": 1728.0,
+        "y": 972.0
+      },
+      "observation": {
+        "x": 0.9,
+        "y": 0.9,
+        "gaze_direction": [
+          0,
+          0,
+          1
+        ],
+        "confidence": 1
+      }
+    }
+  ],
+  "retrieval_enabled": false,
+  "retrieval_radius": 1,
+  "baseline_cv_median_px": 0,
+  "baseline_cv_p95_px": 0,
+  "retrieval_cv_median_px": 0,
+  "retrieval_cv_p95_px": 0,
+  "sample_count": 108,
+  "median_error_px": 0,
+  "validation_median_error_px": 0,
+  "validation_passed": false,
+  "accuracy": null
+}

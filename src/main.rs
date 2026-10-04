@@ -197,6 +197,11 @@ impl EyeOsApp {
         self.calibration
             .as_ref()
             .is_some_and(|profile| profile.validation_passed)
+            && self
+                .tracker
+                .as_ref()
+                .and_then(|t| t.engine().profile())
+                .is_some_and(|p| p.validation_passed)
     }
 
     fn process_events(&mut self, events: Vec<EngineEvent>) {
@@ -1247,6 +1252,7 @@ fn tracker_status_message(status: TrackerStatus) -> String {
             height,
             fps,
             format,
+            ..
         } => format!(
             "Camera streaming at {width}×{height}, {fps} FPS ({format}); looking for a face."
         ),
@@ -1292,9 +1298,8 @@ fn primary_screen_size() -> Point {
     Point::new(1920.0, 1080.0)
 }
 
-/// Windows exposes the physical size reported by the primary display EDID.  Some inexpensive
-/// panels report no size; in that case use the standard 96-DPI conversion and label it only as a
-/// practical validation estimate rather than a hardware measurement.
+/// Physical display geometry is supplied explicitly; missing measurements never
+/// become an inferred angular-precision claim.
 fn tracking_config(screen_size: Point, config: &AppConfig) -> TrackerConfig {
     TrackerConfig {
         screen_size,

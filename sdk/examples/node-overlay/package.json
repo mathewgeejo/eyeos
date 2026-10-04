@@ -1,0 +1,8 @@
+{
+  "name": "eye-tracker-overlay-example",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs",
+  "scripts": { "start": "electron ." },
+  "devDependencies": { "electron": "^44.5.1" }
+}

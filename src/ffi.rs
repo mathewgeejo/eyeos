@@ -277,6 +277,12 @@ pub unsafe extern "C" fn et_process_observation(
         let observation: Observation = serde_json::from_str(unsafe { input(data, len)? })
             .map_err(|e| fail(ET_ARGUMENT, e.to_string()))?;
         with_tracker(handle, |t| {
+            if t.has_camera() {
+                return Err(fail(
+                    ET_STATE,
+                    "stop the owned camera before supplying observations",
+                ));
+            }
             let now = t.timestamp_ms();
             let event = t.observe(observation, now).map_err(|e| fail(ET_STATE, e))?;
             unsafe { output(out, event) }
@@ -310,9 +316,7 @@ pub unsafe extern "C" fn et_import_profile(handle: u64, data: *const u8, len: us
     boundary(|| {
         let json = unsafe { input(data, len)? };
         with_tracker(handle, |t| {
-            t.engine_mut()
-                .import_profile(json)
-                .map_err(|e| fail(ET_STATE, e))
+            t.import_profile(json).map_err(|e| fail(ET_STATE, e))
         })
     })
 }
@@ -403,5 +407,39 @@ mod tests {
     #[test]
     fn panics_are_contained() {
         assert_eq!(boundary(|| panic!("intentional boundary test")), ET_PANIC);
+    }
+    #[test]
+    fn shared_profile_has_identical_coordinates_through_the_c_abi() {
+        let mut handle = 0;
+        assert_eq!(
+            unsafe { et_create(std::ptr::null(), 0, &mut handle) },
+            ET_OK
+        );
+        let profile = include_bytes!("../sdk/tests/profile-v2.json");
+        assert_eq!(
+            unsafe { et_import_profile(handle, profile.as_ptr(), profile.len()) },
+            ET_OK
+        );
+        let observation = serde_json::json!({"x":0.25,"y":0.75,"gaze_direction":[0.0,0.0,1.0],
+            "confidence":1.0,"timestamp_ms":0})
+        .to_string();
+        let mut buffer = EyeBuffer::default();
+        assert_eq!(
+            unsafe {
+                et_process_observation(handle, observation.as_ptr(), observation.len(), &mut buffer)
+            },
+            ET_OK
+        );
+        let event: serde_json::Value =
+            serde_json::from_slice(unsafe { std::slice::from_raw_parts(buffer.data, buffer.len) })
+                .unwrap();
+        assert_eq!(
+            event["estimate"]["raw"],
+            serde_json::json!({"x":480.0,"y":810.0})
+        );
+        assert_eq!(event["estimate"]["filtered"], event["estimate"]["raw"]);
+        assert_eq!(event["estimate"]["precision_validated"], false);
+        assert_eq!(unsafe { et_buffer_free(&mut buffer) }, ET_OK);
+        assert_eq!(et_destroy(handle), ET_OK);
     }
 }

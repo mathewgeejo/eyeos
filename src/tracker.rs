@@ -45,6 +45,7 @@ pub enum TrackerStatus {
         height: u32,
         fps: u32,
         format: String,
+        device_id: String,
     },
     CameraRetrying {
         attempt: u32,
